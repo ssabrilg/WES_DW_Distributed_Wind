@@ -1,0 +1,3657 @@
+---
+title: "Spatial and Economic Prioritization for Distributed Wind"
+format:
+  html:
+    code-fold: true
+    embed-resources: true
+
+jupyter: python3
+---
+
+# Study Overview and Reproducibility
+
+This notebook accompanies the analysis from the article:
+
+**"Spatial and Economic Prioritization for Distributed Wind"**
+
+It explores how distributed wind (DW) energy can be strategically deployed in areas with elevated energy burdens by analyzing spatial, economic, and demographic factors. The analysis includes custom energy burden metrics, demand-adjusted annual energy production $AEP_{\text{Demand}}$, and statistical modeling (mixed-effects and fixed-effects regressions).
+
+The code and data used here ensure full reproducibility of the results presented in the study, including all figures and model outputs. This notebook is designed to allow other researchers to validate, extend, or reuse the methodology.
+
+This notebook follows the same numeration than the article in order to facilitate finding the data and its reproducibility.
+
+# 1. Introduction
+
+This research builds on these prior efforts while leveraging [National Renewable Energy Laboratory’s (NREL) Distributed Wind Energy Futures Study (DWEFS) (Lockshin et al., 2025)](https://wes.copernicus.org/articles/10/1231/2025/), which provides parcel-level techno-economic assessments for distributed wind under recent (2025) and projected future (2035) scenarios. The DWEFS model incorporates land use, siting constraints, electricity demand, wind resource availability, and policy context to size systems and simulate energy generation potential. 
+
+The summarized data by county is like this:
+ 
+```{python}
+#| warning: false
+#| message: false
+import sys
+import re
+import io
+import tomllib
+import requests
+import sqlalchemy as sa
+import pandas as pd
+import numpy as np
+import geopandas as gp
+import seaborn as sns
+from matplotlib.ticker import FuncFormatter
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+pd.set_option("display.max_columns", None)
+
+import os
+os.chdir(os.path.expanduser('~/Downloads/dwfs_postgis-main'))
+conf = tomllib.load(open("./config.toml", "rb"))
+secret = tomllib.load(open("./secret.toml", "rb"))
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+def get_db_engine():
+    url = sa.engine.URL.create(
+        drivername="postgresql+psycopg2",
+        database=secret["atlas"]["database"],
+        host=secret["atlas"]["hostname"],
+        username=secret["atlas"]["username"],
+        password=secret["atlas"].get("password"),  # optional, if not specified will search for .pgpass
+    )
+    return sa.create_engine(url)
+```
+
+```{python}
+#| warning: false
+#| message: false
+# URL to have the FIPS
+url = "https://raw.githubusercontent.com/kjhealy/fips-codes/master/state_and_county_fips_master.csv"
+decoder_ring = pd.read_csv(url, dtype={"fips": str})
+decoder_ring["fips"] = decoder_ring["fips"].str.zfill(5)
+der_ring = decoder_ring[~decoder_ring["fips"].str.endswith("000")]
+
+
+decoder_ring = decoder_ring.rename(columns={
+    "fips": "fips",
+    "state_abbrev": "state",
+    "name": "county"
+})[["fips", "state", "county"]]
+
+
+decoder_ring = decoder_ring[~decoder_ring["state"].isin(["AK", "HI"])]
+
+
+ct_fips_codes = ["09001", "09003", "09005", "09007", "09009", "09011", "09013", "09015"]
+ct_names = [
+    "Fairfield County", "Hartford County", "Litchfield County", "Middlesex County",
+    "New Haven County", "New London County", "Tolland County", "Windham County"
+]
+
+for fips, name in zip(ct_fips_codes, ct_names):
+    decoder_ring.loc[decoder_ring["fips"] == fips, "county"] = name
+
+```
+
+National totals:
+
+```{python}
+#| warning: false
+#| message: false
+def setAEPdf(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={"countyfp": "fips"})
+
+    # Merge with decoder_ring on fips
+    df = decoder_ring.merge(df, on="fips", how="left")
+    # Convert from kWh to TWh
+    for col in [
+        "cost_viable_aep_sum",
+        "cost_viable_res_aep_sum",
+        "cost_viable_com_aep_sum",
+        "cost_viable_ind_aep_sum"
+    ]:
+        df[col] = df[col] * 1e-9
+    # Rename columns
+    df = df.rename(columns={
+        "cost_viable_aep_sum": "cost_viable_aep_sum_twh",
+        "cost_viable_res_aep_sum": "cost_viable_res_aep_sum_twh",
+        "cost_viable_com_aep_sum": "cost_viable_com_aep_sum_twh",
+        "cost_viable_ind_aep_sum": "cost_viable_ind_aep_sum_twh",
+    })
+
+    # Filter out rows where all *_twh columns are NA
+    twh_cols = [
+        "cost_viable_aep_sum_twh",
+        "cost_viable_res_aep_sum_twh",
+        "cost_viable_com_aep_sum_twh",
+        "cost_viable_ind_aep_sum_twh"
+    ]
+    df = df[~df[twh_cols].isna().all(axis=1)]
+
+    return df
+```
+
+```{python}
+#| warning: false
+#| message: false
+def getAllData(model_run: str) -> pd.DataFrame:
+    query = f"""
+    WITH county_agg AS (
+      SELECT
+        r.run_id,
+        a.countyfp,
+        SUM(r.wind_aep_kwh) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold) AS cost_viable_aep_sum,
+        SUM(r.wind_aep_kwh) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold AND a.sector_abbr = 'res') AS cost_viable_res_aep_sum,
+        SUM(r.wind_aep_kwh) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold AND a.sector_abbr = 'com') AS cost_viable_com_aep_sum,
+        SUM(r.wind_aep_kwh) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold AND a.sector_abbr = 'ind') AS cost_viable_ind_aep_sum,
+        SUM(r.techpot_kw) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold) AS cost_viable_techpot_sum,
+        SUM(r.capacity_kw) FILTER (WHERE r.breakeven_cost >= bt.breakeven_threshold) AS cost_viable_capacity_sum,
+        SUM(r.wind_aep_kwh) FILTER (WHERE r.breakeven_cost >= 0) AS positive_breakeven_aep_sum,
+        SUM(r.techpot_kw) FILTER (WHERE r.breakeven_cost >= 0) AS positive_breakeven_techpot_sum,
+        SUM(r.capacity_kw) FILTER (WHERE r.breakeven_cost >= 0) AS positive_breakeven_capacity_sum
+      FROM dwind.result r
+      JOIN dwind.model_run mr USING (run_id)
+      JOIN dwind.agent a USING (gid)
+      JOIN dwind.breakeven_threshold bt USING (run_id, capacity_kw)
+      WHERE r.run_id = '{model_run}'
+      GROUP BY r.run_id, a.countyfp
+    )
+
+    SELECT
+      a.countyfp,
+      a.cost_viable_res_aep_sum,
+      a.cost_viable_com_aep_sum,
+      a.cost_viable_ind_aep_sum,
+      a.cost_viable_aep_sum,
+      a.cost_viable_techpot_sum,
+      a.cost_viable_capacity_sum,
+      a.positive_breakeven_aep_sum,
+      a.positive_breakeven_techpot_sum,
+      a.positive_breakeven_capacity_sum
+    FROM county_agg a
+    ORDER BY a.countyfp;
+    """
+
+    with get_db_engine().connect() as con:
+        df = pd.read_sql_query(sql=query, con=con)
+
+    df = setAEPdf(df)  # This is your converted R setAEPdf logic
+    return df
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+df2025btm =  getAllData("1")
+df2035btm =  getAllData("2")
+```
+
+Respaldo
+
+```{python}
+#df2025btm_r = df2025btm
+#df2035btm_r = df2035btm
+```
+
+```{python}
+#df2025btm = df2025btm_r
+#df2035btm = df2035btm_r
+```
+
+## Year 2025 county summary
+
+```{python}
+#| warning: false
+#| message: false
+df2025btm.head()
+```
+
+## Year 2025 county summary
+
+```{python}
+#| warning: false
+#| message: false
+df2035btm.head()
+```
+
+# 2. Methods
+
+## 2.1 Data Sources
+
+This study focuses on data for the contiguous United States (CONUS), excluding Alaska and Hawaii. Data on energy generation potential, energy burden and modeled energy demand offsets are used by their corresponding scenario year (2025 or 2035), while other socioeconomic and demographic data corresponds to the latest available datasets only to reflect current demographics and socioeconomic characteristics across CONUS.
+
+| **Data**              | **Description**                                                                                       | **Data Year & Source**                                                                                                                                      |
+|-----------------------|--------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| AEP Values            | Annual Energy Production – Distributed Wind Energy Futures Study                                       | 2022, 2025, 2035 [NREL DW Energy Futures](https://www.nrel.gov/docs/fy24osti/86940.pdf)                                                                    |
+| Poverty and Income    | U.S. Census Bureau, SAIPE Program                                                                      | 2023 [SAIPE Program](https://www.census.gov/data/datasets/2023/demo/saipe/2023-state-and-county.html)                                                      |
+| GDP                   | U.S. Bureau of Economic Analysis (BEA)                                                                 | 2023 [BEA GDP Data](https://apps.bea.gov/itable/?ReqID=70)                                                                                                   |
+| Ethnicity             | U.S. Census Bureau, County Population by Characteristics                                               | 2023 [Population Estimates](https://www2.census.gov/programs-surveys/popest/datasets/2020-2023/counties/asrh/cc-est2023-alldata.csv)                      |
+| Energy Demand         | NREL – Net Electricity & Gas Consumption, State and Local Planning for Energy                         | 2025, 2035 [NREL SLOPE](https://maps.nrel.gov/slope)                                                                                                         |
+| Unemployment          | U.S. Bureau of Labor Statistics, LAUS Program                                                          | 2023 [BLS LAUS Data](https://www.bls.gov/lau/tables.htm#cntyaa)                                                                                             |
+| Residential Units     | U.S. Census Bureau, Housing Unit Totals                                                                | 2024 [Housing Units](https://www.census.gov/data/tables/time-series/demo/popest/2020s-total-housing-units.html)                                           |
+
+
+```{python}
+#| warning: false
+#| message: false
+state_abbreviations = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA",
+    "Colorado": "CO", "Connecticut": "CT", "District of Columbia": "DC", "Delaware": "DE", "Florida": "FL",
+    "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
+    "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS", "Missouri": "MO",
+    "Montana": "MT", "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ",
+    "New Mexico": "NM", "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
+    "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
+    "Virginia": "VA", "Washington": "WA", "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY"
+}
+```
+
+
+
+
+```{python}
+#| warning: false
+#| message: false
+import urllib3
+import subprocess
+import sys
+
+try:
+    import xlrd
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "xlrd"])
+    import xlrd  
+
+try:
+    import openpyxl
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+    import openpyxl
+
+
+# os.chdir(os.path.expanduser('~/Downloads'))
+
+# Clean up Geography.ID to get fips
+def clean_fips(x):
+    x = re.sub(r'^G', '', x)
+    x = re.sub(r'^(.{2})0', r'\1', x)
+    x = re.sub(r'0$', '', x)
+    return x
+
+
+# 1. Poverty data
+# df_poverty = pd.read_excel("data/est23all.xls", skiprows=3)
+# df_poverty = pd.read_excel("https://www2.census.gov/programs-surveys/saipe/datasets/2023/2023-state-and-county/est23all.xls", skiprows=3)
+response = requests.get("https://www2.census.gov/programs-surveys/saipe/datasets/2023/2023-state-and-county/est23all.xls", verify=False)
+df_poverty = pd.read_excel(io.BytesIO(response.content), skiprows=3)
+
+df_poverty = df_poverty[df_poverty['County FIPS Code'] != 0]
+df_poverty['State FIPS Code'] = df_poverty['State FIPS Code'].astype(str)
+df_poverty['State FIPS Code'] = df_poverty['State FIPS Code'].str.zfill(2)
+df_poverty['County FIPS Code'] = df_poverty['County FIPS Code'].astype(str)
+df_poverty['County FIPS Code'] = df_poverty['County FIPS Code'].str.zfill(3)
+
+df_poverty['fips'] = df_poverty['State FIPS Code'] + df_poverty['County FIPS Code']
+
+df_poverty = df_poverty[['fips', 'Poverty Percent, All Ages']]
+df_poverty['Poverty Percent, All Ages'] = pd.to_numeric(df_poverty['Poverty Percent, All Ages'], errors='coerce')
+
+
+# 2. GDP data
+
+# df_gdp = pd.read_csv('data/CAGDP2__ALL_AREAS_2001_2023.csv', encoding='ISO-8859-1')
+
+import requests
+import zipfile
+import io
+
+response = requests.get("https://apps.bea.gov/regional/zip/CAGDP2.zip")
+with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+    with z.open("CAGDP2__ALL_AREAS_2001_2023.csv") as f:
+        df_gdp = pd.read_csv(f, encoding='ISO-8859-1')
+
+df_gdp = df_gdp.iloc[:107780].drop(df_gdp.columns[[2, 3, 4, 5] + list(range(7, 30))], axis=1)
+df_gdp.rename(columns={"GeoFIPS": "fips"}, inplace=True)
+df_gdp["fips"] = df_gdp["fips"].str.replace(r"\D", "", regex=True)
+df_gdp = df_gdp[~df_gdp["fips"].str.endswith("000")]
+df_gdp['Description'] = df_gdp['Description'].str.strip().str.replace('"', '')
+
+desc_filter = [
+    'Agriculture, forestry, fishing and hunting', 
+    'All industry total', 
+    'Utilities', 
+    'Manufacturing'
+]
+df_gdp = df_gdp[df_gdp['Description'].isin(desc_filter)]
+
+# Pivot wider 
+df_gdp_wide = df_gdp.pivot_table(
+    index='fips', 
+    columns='Description', 
+    values='2023', 
+    aggfunc='first'
+).reset_index()
+
+for col in desc_filter:
+    df_gdp_wide[col] = pd.to_numeric(df_gdp_wide[col], errors='coerce')
+df_gdp_wide['All industry total'] = df_gdp_wide['All industry total'] 
+
+df_gdp_wide['AgricultureInd'] = (df_gdp_wide['Agriculture, forestry, fishing and hunting'] / df_gdp_wide['All industry total']) * 100
+df_gdp_wide['UtilityInd'] = (df_gdp_wide['Utilities'] / df_gdp_wide['All industry total']) * 100
+df_gdp_wide['ManufactureInd'] = (df_gdp_wide['Manufacturing'] / df_gdp_wide['All industry total']) * 100
+df_gdp = df_gdp_wide
+
+
+# 3. Ethnicity data
+df_ethnicity = pd.read_csv("~/Downloads/data/cc-est2023-alldata.csv", encoding='ISO-8859-1')
+#df_ethnicity = pd.read_csv("https://www2.census.gov/programs-surveys/popest/datasets/2020-2023/counties/asrh/cc-est2023-alldata.csv", encoding='ISO-8859-1')
+#urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+#response = requests.get("https://www2.census.gov/programs-surveys/popest/datasets/2020-2023/counties/asrh/cc-est2023-alldata.csv", verify=False)
+#df_ethnicity = pd.read_csv(io.BytesIO(response.content), encoding='ISO-8859-1')
+
+# Filter YEAR == 5 & AGEGRP == 0
+df_ethnicity = df_ethnicity[(df_ethnicity['YEAR'] == 5) & (df_ethnicity['AGEGRP'] == 0)]
+
+df_ethnicity['fips'] = df_ethnicity['STATE'].astype(str).str.zfill(2) + df_ethnicity['COUNTY'].astype(str).str.zfill(3)
+df_ethnicity = df_ethnicity[['fips', 'STNAME', 'CTYNAME', 'TOT_POP', 'NHWAC_MALE', 'NHWAC_FEMALE']]
+
+df_ethnicity['NonWhite'] = (1 - (df_ethnicity['NHWAC_FEMALE'] + df_ethnicity['NHWAC_MALE']) / df_ethnicity['TOT_POP']) * 100
+
+
+# 4. Demand data
+#df_demand = pd.read_csv("~/Downloads/data/energy_consumption_expenditure_business_as_usual_county.csv")
+
+response = requests.get("https://gds-files.nrel.gov/slope/energy_consumption_expenditure_business_as_usual.zip")
+with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+    # Extract and read the specific CSV file
+    with z.open("energy_consumption_expenditure_business_as_usual_county.csv") as f:
+        df_demand = pd.read_csv(f)
+
+
+# Select columns and clean Geography ID to fips
+df_demand = df_demand.iloc[:, :9]
+df_demand['fips'] = df_demand['Geography ID'].astype(str).apply(clean_fips)
+
+df_demand = df_demand.sort_values('fips')
+
+# Filter by year
+df_demand2022 = df_demand[df_demand['Year'] == 2022]
+df_demand2025 = df_demand[df_demand['Year'] == 2025]
+df_demand2035 = df_demand[df_demand['Year'] == 2035]
+
+# Select specific columns (adjust columns as needed)
+cols_to_keep = df_demand.columns[[0,1,2,3,4,6,7,8,9]]
+
+df_demand2022 = df_demand2022[cols_to_keep]
+df_demand2025 = df_demand2025[cols_to_keep]
+df_demand2035 = df_demand2035[cols_to_keep]
+
+# Group by fips, Year, Source, Sector and summarize Consumption and Expenditure
+def group_and_summarize(df):
+    return df.groupby(['fips', 'Year', 'Source', 'Sector'], as_index=False).agg({
+        'Consumption MMBtu': 'sum',
+        'Expenditure US Dollars': 'sum'
+    })
+
+df_demand2022 = group_and_summarize(df_demand2022)
+df_demand2025 = group_and_summarize(df_demand2025)
+df_demand2035 = group_and_summarize(df_demand2035)
+
+# Pivot wider for each year
+def pivot_demand(df):
+    df_pivot = df.pivot_table(index=['fips', 'Year', 'Source'], columns='Sector', values=['Consumption MMBtu', 'Expenditure US Dollars'])
+    df_pivot.columns = ['_'.join(col).strip() for col in df_pivot.columns.values]
+    df_pivot = df_pivot.reset_index()
+
+    # Pivot wider again by Source to get columns per Source-Sector
+    df_final = df_pivot.pivot_table(index=['fips', 'Year'], columns='Source', values=df_pivot.columns[3:], aggfunc='first')
+    
+    # Flatten multiindex columns
+    df_final.columns = ['_'.join(map(str, col)).strip() for col in df_final.columns.values]
+    df_final = df_final.reset_index()
+    return df_final
+
+df_demand2022 = pivot_demand(df_demand2022)
+df_demand2025 = pivot_demand(df_demand2025)
+df_demand2035 = pivot_demand(df_demand2035)
+
+# Clean column names to remove trailing '_elec' (if applicable)
+df_demand2022.columns = df_demand2022.columns.str.replace('_elec$', '', regex=True)
+df_demand2025.columns = df_demand2025.columns.str.replace('_elec$', '', regex=True)
+df_demand2035.columns = df_demand2035.columns.str.replace('_elec$', '', regex=True)
+
+# Calculate totals and Residential_tWh for each year
+# def calc_totals(df):
+#     cons_cols = [col for col in df.columns if col.startswith('Consumption MMBtu')]
+#     exp_cols = [col for col in df.columns if col.startswith('Expenditure US Dollars')]
+    
+#     df['total_tWh'] = df[cons_cols].sum(axis=1, skipna=True) * 293083 * 1e-9
+#     df['total_USD'] = df[exp_cols].sum(axis=1, skipna=True)
+#     if 'Consumption MMBtu_residential' in df.columns:
+#         df['Residential_tWh'] = df['Consumption MMBtu_residential'] * 293083 * 1e-9
+#     else:
+#         df['Residential_tWh'] = np.nan
+#     return df
+
+def calc_totals(df):
+    # Use only the non-ng columns
+    cons_cols = [
+        'Consumption MMBtu_commercial',
+        'Consumption MMBtu_residential',
+        'Consumption MMBtu_industrial'
+    ]
+    
+    exp_cols = [
+        'Expenditure US Dollars_commercial',
+        'Expenditure US Dollars_residential',
+        'Expenditure US Dollars_industrial'
+    ]
+    
+    # Use only existing columns in case of missing data
+    cons_cols = [col for col in cons_cols if col in df.columns]
+    exp_cols = [col for col in exp_cols if col in df.columns]
+    
+    df['total_tWh'] = df[cons_cols].sum(axis=1, skipna=True) * 293083 * 1e-9
+    df['total_USD'] = df[exp_cols].sum(axis=1, skipna=True)
+    
+    if 'Consumption MMBtu_residential' in df.columns:
+        df['Residential_tWh'] = df['Consumption MMBtu_residential'] * 293083 * 1e-9
+    else:
+        df['Residential_tWh'] = np.nan
+    
+    return df
+
+df_demand2022 = calc_totals(df_demand2022)
+df_demand2025 = calc_totals(df_demand2025)
+df_demand2035 = calc_totals(df_demand2035)
+
+
+# 5. Income data
+#df_income = pd.read_excel("~/Downloads/data/est23all.xls", skiprows=3)
+# df_income = pd.read_excel("https://www2.census.gov/programs-surveys/saipe/datasets/2023/2023-state-and-county/est23all.xls", skiprows=3)
+response = requests.get("https://www2.census.gov/programs-surveys/saipe/datasets/2023/2023-state-and-county/est23all.xls", verify=False)
+df_income = pd.read_excel(io.BytesIO(response.content), skiprows=3)
+df_income = df_income[df_income['County FIPS Code'] != 0]
+
+df_income['fips'] = df_income['State FIPS Code'].astype(str).str.zfill(2) + df_income['County FIPS Code'].astype(str).str.zfill(3)
+
+df_income = df_income[['fips', 'Median Household Income']]
+df_income['Median Household Income'] = pd.to_numeric(df_income['Median Household Income'], errors='coerce')
+
+
+# 6. Unemployment data
+# df_uep = pd.read_excel("~/Downloads/data/laucnty23.xlsx", skiprows=1)
+df_uep = pd.read_excel("https://raw.githubusercontent.com/sabrilg-nrel/unemploymentUSAdata/main/laucnty23.xlsx", skiprows=1)
+#response = requests.get("https://raw.githubusercontent.com/sabrilg-nrel/unemploymentUSAdata/main/laucnty23.xlsx", verify=False)
+#df_uep = pd.read_excel(io.BytesIO(response.content), skiprows=3)
+df_uep.columns = ["LAUS", "StateFIPS", "CountyFIPS", "CountyState", "Year", "Force", "Employed", "Unemployed", "UnemploymentRate"]
+df_uep = df_uep.dropna(subset=['StateFIPS', 'CountyFIPS'])
+
+df_uep['StateFIPS'] = df_uep['StateFIPS'].astype(int)
+df_uep['CountyFIPS'] = df_uep['CountyFIPS'].astype(int)
+
+df_uep['fips'] = (
+    df_uep['StateFIPS'].astype(str).str.zfill(2)
+    + df_uep['CountyFIPS'].astype(str).str.zfill(3)
+)
+df_uep = df_uep.drop(columns=["LAUS", "StateFIPS", "CountyFIPS", "CountyState", "Year", "Force", "Employed", "Unemployed"])
+
+# Drop Puerto Rico rows 
+df_uep = df_uep.drop(index=[0] + list(range(3143, 3221)))  
+
+
+# 7. Residential units data
+#df_resunits = pd.read_excel("~/Downloads/data/CO-EST2024-HU.xlsx", skiprows=3)
+# df_resunits = pd.read_excel("https://www2.census.gov/programs-surveys/popest/tables/2020-2024/housing/totals/CO-EST2024-HU.xlsx", skiprows=3)
+
+response = requests.get("https://www2.census.gov/programs-surveys/popest/tables/2020-2024/housing/totals/CO-EST2024-HU.xlsx", verify=False)
+df_resunits = pd.read_excel(io.BytesIO(response.content), skiprows=3)
+
+# Clean data
+df_resunits = df_resunits.drop(index=0).iloc[:, [0,4,6]]  # Drop first row and keep columns 1,5,7
+
+# For state abbreviation mapping, use your dictionary state_abbreviations
+def extract_state_abbrev(s):
+    parts = s.split(', ')
+    return state_abbreviations.get(parts[1], np.nan) if len(parts) > 1 else np.nan
+
+df_resunits['state'] = df_resunits.iloc[:,0].apply(extract_state_abbrev)
+df_resunits.iloc[:, 0] = df_resunits.iloc[:, 0].str.replace(r'^\.', '', regex=True)
+df_resunits.iloc[:, 0] = df_resunits.iloc[:, 0].str.replace(r',.*', '', regex=True)
+
+df_resunits.columns = ['county', 'ResUnit2022', 'ResUnit2024', 'state']
+df_resunits = df_resunits.merge(decoder_ring, on=['state', 'county'], how='left')
+df_resunits['fips'] = df_resunits['fips'].astype(str)
+df_resunits = df_resunits.iloc[:-6]
+
+```
+
+## 2.2 Metrics Description
+- **AEP-to-demand ratio $AEP_{\text{demand}}$**  is defined as:
+
+
+$$
+    AEP_{\text{demand}} = \frac{\text{AEP}}{\text{Total Electricity Demand}}
+$$
+
+This ratio standardizes distributed wind generation relative to total electricity demand across residential, commercial, and industrial sectors accounting for variation in population density and consumption levels. Sector-specific analyses also use disaggregated demand components as needed.
+
+- **Energy Burden (EB)** is defined as:
+
+$$
+    EB = \frac{\text{Total Residential Electricity Expenditure}}{\text{Median Household Income} \times \text{Number of Residential Units}}
+$$
+ This metric reflects residential-level affordability. In our analysis, we compute EB at the county level as the ratio of total residential electricity expenditure to the product of median household income and the number of residential units in the county.
+
+- **Energy Burden relative to GDP $EB_{GDP}$** is defined as 
+
+$$
+    EB_{\text{GDP}} = \frac{\text{Total County Energy Expenditure}}{\text{GDP}}
+$$
+
+This metric provides a broader perspective on county-level economic performance. Rather than focusing solely on residential metrics, this approach considers the county as an economic unit—viewing its GDP and energy expenditures as components of overall economic output.
+
+- **Net Energy Return (NER)** is an algebraic variation of EB and is defined as
+
+$$
+    NER = \frac{\text{Household Income} - \text{Energy Expenditure}}{\text{Energy Expenditure}}
+$$
+
+This metric, rather than indicating energy cost burden, reflects the economic return or residual income relative to energy expenditure. Besides, it provides smoother statistical properties and a complementary interpretive angle. 
+
+Since NER is an algebraic transformation of EB, they are mathematically linked as:
+
+$$
+    NER = \frac{1}{EB} - 1
+$$
+
+- **$NER_{\text{GDP}}$** is defined as 
+
+$$
+NER_{\text{GDP}} = \frac{\text{GDP} - \text{Total County Energy Expenditure}}{\text{Total County Energy Expenditure}}
+$$
+
+This metric evaluates the return of economic output over energy spending at the county level.
+
+All these metrics are tested for their normal distribution by a Kolmogorov Smirnov test. When this test result negative, a Box-Cox procedure is applied to find the most suitable tranformation to a normal distribution.
+
+```{python}
+#| warning: false
+#| message: false
+from scipy.stats import boxcox
+from scipy.stats import boxcox_normmax
+
+# def transform_boxcox(x):
+#     x = np.array(x)
+#     transformed = np.full_like(x, np.nan, dtype=float)  # initialize result with NaNs
+#     mask = x > 0
+#     x_pos = x[mask]
+
+#     if len(x_pos) == 0:
+#         return {'data': transformed, 'lambda': None}
+
+#     # Grid search for optimal lambda
+#     lambdas = np.arange(-2, 2.1, 0.1)
+#     log_likelihoods = []
+
+#     for lmbda in lambdas:
+#         if lmbda == 0:
+#             temp = np.log(x_pos)
+#         else:
+#             temp = (x_pos ** lmbda - 1) / lmbda
+#         ll = - (len(x_pos) / 2) * np.log(np.var(temp, ddof=1))
+#         log_likelihoods.append(ll)
+
+#     best_idx = np.argmax(log_likelihoods)
+#     lambda_opt = lambdas[best_idx]
+
+#     # Apply final transformation
+#     if lambda_opt == 0:
+#         transformed_vals = np.log(x_pos)
+#     else:
+#         transformed_vals = (x_pos ** lambda_opt - 1) / lambda_opt
+
+#     # Place transformed values back in original shape
+#     transformed[mask] = transformed_vals
+
+#     return {'data': transformed, 'lambda': round(lambda_opt, 2)}
+
+
+# This function makes lambda fixed to 0.5 as R chooses. This is done in order to make comparable the data with the R version.
+def transform_boxcox(x, lambda_fixed):
+    x = np.array(x)
+    transformed = np.full_like(x, np.nan, dtype=float)  # Initialize with NaNs
+    mask = x > 0
+    x_pos = x[mask]
+    
+    if lambda_fixed == 0:
+        transformed_vals = np.log(x_pos)
+    else:
+        transformed_vals = (x_pos ** lambda_fixed - 1) / lambda_fixed
+    
+    transformed[mask] = transformed_vals
+    return transformed, lambda_fixed
+
+```
+
+After this all the variables and their transformations are added to the initial information from DWEFS.
+
+```{python}
+#| warning: false
+#| message: false
+def add_energy_vars(df, year):
+    # Merge datasets by fips
+    df = df.merge(df_poverty, on='fips', how='left')
+    df = df.merge(df_gdp.loc[:, ['fips', 'AgricultureInd', 'UtilityInd', 'ManufactureInd','All industry total']], on='fips', how='left')
+    df = df.merge(df_ethnicity.iloc[:, [0,6]], on='fips', how='left')  
+    df = df.merge(df_income, on='fips', how='left')
+    df = df.merge(df_uep, on='fips', how='left')
+    
+    # Add residential units by year
+    if str(year) == "2022":
+        df = df.merge(df_resunits.iloc[:, [1,4]], on='fips', how='left')
+    elif str(year) in ["2025", "2035"]:
+        df = df.merge(df_resunits.iloc[:, [2,4]], on='fips', how='left')
+    
+    # Add demand data by year
+    if str(year) == "2022":
+        df = df.merge(df_demand2022.iloc[:, [0,12,14,15,16]], on='fips', how='left')
+    elif str(year) == "2025":
+        df = df.merge(df_demand2025.iloc[:, [0,12,14,15,16]], on='fips', how='left')
+    elif str(year) == "2035":
+        df = df.merge(df_demand2035.iloc[:, [0,12,14,15,16]], on='fips', how='left')
+    
+
+    # Rename columns
+    df.rename(columns={
+        "Transportation Burden Pct Income": "TransportationBurden%",
+        "Energy Burden Pct Income": "EnergyBurden%",
+        "Poverty Percent, All Ages": "Poverty%"
+    }, inplace=True)
+
+    # Filter rows
+    df = df[df['cost_viable_aep_sum_twh'].notna()]
+
+    # Calculate additional variables
+    df['aep_demand'] = df['cost_viable_aep_sum_twh'] / df['total_tWh']
+    df['aepRES_demand'] = df['cost_viable_res_aep_sum_twh'] / df['Residential_tWh']
+
+    df['energy_gdp'] = df['total_USD'] / df['All industry total'] * 100
+    df['energy_gdplog'] = np.log(2 + df['total_USD'] / df['All industry total'] * 100)  # x-shift +2
+    df['Nh'] = (df['All industry total'] - df['total_USD']) / df['total_USD']
+    df['Nhlog'] = np.log(df['Nh'])
+
+    # Residential energy burden
+    if year == 2022 and 'ResUnit2022' in df.columns:
+        df['EBres'] = df['Expenditure US Dollars_residential'] / (df['Median Household Income'] * df['ResUnit2022']) * 100
+    else:
+        df['EBres'] = df['Expenditure US Dollars_residential'] / (df['Median Household Income'] * df['ResUnit2024']) * 100
+
+    df['Nhres'] = (1 - df['EBres'] / 100) / (df['EBres'] / 100)
+    df['Nhres_log'] = np.log(df['Nhres'])
+    df['aepRES_demand_log'] = np.log(df['aepRES_demand'])
+
+    # Box-Cox transforms
+    # bc_aep_demand = transform_boxcox(df['aep_demand'])
+    # df['aep_demand_boxcox'] = bc_aep_demand['data']
+    # bc_aepRES_demand = transform_boxcox(df['aepRES_demand'])
+    # df['aepRES_demand_boxcox'] = bc_aepRES_demand['data']
+    # df['aepRES_demand_boxcox_lambda'] = bc_aepRES_demand['lambda']
+    # df['aep_boxcox'] = transform_boxcox(df['cost_viable_aep_sum_twh'])['data']
+    # bc_EBres = transform_boxcox(df['EBres'])
+    # df['EBres_boxcox'] = bc_EBres['data']
+    # df['EBres_boxcox_lambda'] = bc_EBres['lambda']
+    # Box-Cox transforms (updated to unpack tuples)
+    df['aep_demand_boxcox'], _ = transform_boxcox(df['aep_demand'], 0.3)
+    df['aepRES_demand_boxcox'], df['aepRES_demand_boxcox_lambda'] = transform_boxcox(df['aepRES_demand'], 0.2)
+    df['aep_boxcox'], _ = transform_boxcox(df['cost_viable_aep_sum_twh'], 0.2)
+    df['EBres_boxcox'], df['EBres_boxcox_lambda'] = transform_boxcox(df['EBres'], 0.5)
+
+
+    return df
+
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+df2035btm = add_energy_vars(df2035btm, 2035)
+df2025btm = add_energy_vars(df2025btm, 2025)
+```
+
+
+
+## 2.3 Correlations
+
+This analysis examines correlations across key variables including $NER$, $EB$, and $AEP_{\text{Demand}}$ at residential, commercial, industrial, and combined-sector demands at the county level.
+
+To assess the relationships between key variables, both parametric and non-parametric correlation methods were employed. Box-Cox transformations were applied to normalize the data for Pearson correlation analysis, while Kendall’s Tau was used as a robust, non-parametric alternative to capture rank-based associations under non-normal conditions.
+
+Kendall’s Tau evaluates ordinal association by comparing all possible observation pairs. A pair $ (x_i, y_i), (x_j, y_j) $ is **concordant** if the ranks of both variables move in the same direction, and **discordant** if they move oppositely. The coefficient is calculated as:
+
+$$
+\tau = \frac{C - D}{\sqrt{(C + D + T_1)(C + D + T_2)}}
+$$
+
+where $ C $ and $ D $ represent the number of concordant and discordant pairs, respectively, and $ T_1 $, $T_2$ account for ties in each variable. Positive values of $ \tau $ indicate a direct association; negative values indicate an inverse relationship.
+
+## 2.4 Weighted Ranking and Grouping 
+
+This ranking emphasizes **correlation strength** by assigning it half the total weight. To support a more comprehensive and scalable assessment, we also incorporate key metrics—including residential $AEP_{\text{Demand}}$ —under both the 2025 and 2035 scenarios and total residential electricity demand. Including these variables ensures that states with low demand are not inadvertently over-prioritized due to the standardization inherent in the $AEP_{\text{Demand}}$ calculation.
+The final weighted score is computed by ranking each variable individually, then combining them using the formula:
+
+$$
+\text{rank}_{\text{res\_demand}} = 
+0.5 \cdot (\text{rank}_{25} + \text{rank}_{35}) +
+0.25 \cdot (\text{rank}_{AEP/D,25} + \text{rank}_{AEP/D,35}) +
+0.25 \cdot (\text{rank}_{\text{Dem},25} + \text{rank}_{\text{Dem},35})
+$$
+
+## 2.5 Mixed- and fixed-effects modeling of regional predictors 
+
+To identify key predictors of residential EB at the county level, we implement 
+
+1. A mixed-effects linear regression model using nationwide data, with states modeled as random effects to account for unobserved heterogeneity across regions, and county-level covariates -- including poverty rate, percentage of agricultural employment, and percentage of the population identifying as non-White racial and ethnic groups—treated as fixed effects.
+
+2. Following the identification of state-level variation, we conduct separate **fixed-effects linear regressions** for representative states from each of the groups defined in the ranking analysis. These models offer more granular insights into the performance of key predictors across different regional contexts and contribute to the statistical robustness of the EB model. To ensure the validity of these models, we evaluate key diagnostics:
+    - Adjusted $R^2$.
+    - Residual distributions.
+    - Variance homogeneity (homoskedasticity).
+
+# Results
+
+## 3.1 Energy burden and net energy return (residential level)
+
+```{python}
+#| warning: false
+#| message: false
+def generate_EBres_summary(df, year_label="Year"):
+    
+    states = df['state'].dropna().unique()
+    states = [state for state in states if state != "DC"]
+
+    plot_list = []
+    summary_EBres = []
+
+    for state in states:
+        state_data = df[(df['state'] == state) & (df['EBres'].notna())]
+
+        if state_data.empty:
+            continue
+
+        mean_state = state_data['EBres'].mean()
+        median_state = state_data['EBres'].median()
+        sd_state = state_data['EBres'].std()
+        perc90 = state_data['EBres'].quantile(0.9)
+
+        summary_EBres.append({
+            'state': state,
+            'mean_ebres': mean_state,
+            'median_ebres': median_state,
+            'sd_ebres': sd_state
+        })
+
+        plt.figure(figsize=(8, 6))
+        ax = sns.histplot(state_data['EBres'], bins=15, color="darkseagreen", edgecolor="darkseagreen", alpha=0.7)
+        plt.axvline(median_state, color="black", linestyle="--", linewidth=1)
+        plt.axvline(perc90, color="red", linestyle="--", linewidth=1)
+
+        plt.title(f"Energy Burden Distribution in {state} - {year_label}", fontsize=16)
+        plt.xlabel("Energy Burden (%)", fontsize=14)
+        plt.ylabel("Count of Counties", fontsize=14)
+        plt.text(median_state - median_state / 5, 10, f"Median: {median_state:.2f}", color="black", fontsize=10)
+        plt.text(median_state - median_state / 5, 9, f"90th Percentile: {perc90:.2f}", color="red", fontsize=10)
+
+        plt.tight_layout()
+        plot_list.append(plt.gcf())
+        plt.close()
+
+    
+    summary_EBres_df = pd.DataFrame(summary_EBres)
+    summary_EBres_df = summary_EBres_df.sort_values(by='mean_ebres', ascending=False)
+    national_mean = summary_EBres_df['mean_ebres'].mean()
+    national_median = summary_EBres_df['median_ebres'].median()
+
+    summary_EBres_df['mean_comparison'] = summary_EBres_df['mean_ebres'].apply(lambda x: 'Above' if x > national_mean else 'Below')
+    summary_EBres_df['median_comparison'] = summary_EBres_df['median_ebres'].apply(lambda x: 'Above' if x > national_median else 'Below')
+
+    return {
+        'summary': summary_EBres_df,
+        'plots': plot_list
+    }
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+import os
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import requests
+import zipfile
+import io
+import tempfile
+import warnings
+warnings.filterwarnings("ignore", message=".*Tight layout not applied.*")
+
+def EB_heatmap(df_summary):
+    national_median = df_summary['median_ebres'].median()
+    national_mean = df_summary['mean_ebres'].mean()
+    df_summary = df_summary.copy()
+    df_summary['difference_from_median'] = df_summary['median_ebres'] - national_median
+    df_summary['difference_from_mean'] = df_summary['mean_ebres'] - national_mean
+
+    response = requests.get('https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_state_20m.zip')
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        zip_path = os.path.join(tmpdirname, "cb_2020_us_state_20m.zip")
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmpdirname)
+            shapefile_name = [f for f in z.namelist() if f.endswith('.shp')][0]
+            shapefile_path = os.path.join(tmpdirname, shapefile_name)
+            states_gdf = gpd.read_file(shapefile_path)
+
+    states_gdf = states_gdf[~states_gdf['STUSPS'].isin(['AK', 'HI', 'PR'])]
+
+    merged_gdf = states_gdf.merge(df_summary, left_on='STUSPS', right_on='state', how='left')
+
+    cmap = plt.cm.get_cmap('RdYlGn_r')
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 16))  
+
+    # Difference from median
+    vmin_median, vmax_median = merged_gdf['difference_from_median'].min(), merged_gdf['difference_from_median'].max()
+    norm_median = mcolors.TwoSlopeNorm(vmin=vmin_median, vcenter=0, vmax=vmax_median)
+    merged_gdf.plot(column='difference_from_median', cmap=cmap, norm=norm_median,
+                    linewidth=0.8, edgecolor='black', ax=axes[0], legend=True)
+    axes[0].set_title('Energy Burden % by State\n(Difference from National Median)', fontsize=14)
+    axes[0].axis('off')
+
+    # Difference from mean
+    vmin_mean, vmax_mean = merged_gdf['difference_from_mean'].min(), merged_gdf['difference_from_mean'].max()
+    norm_mean = mcolors.TwoSlopeNorm(vmin=vmin_mean, vcenter=0, vmax=vmax_mean)
+    merged_gdf.plot(column='difference_from_mean', cmap=cmap, norm=norm_mean,
+                    linewidth=0.8, edgecolor='black', ax=axes[1], legend=True)
+    axes[1].set_title('Energy Burden % by State\n(Difference from National Mean)', fontsize=14)
+    axes[1].axis('off')
+
+    for ax in axes:
+        for idx, row in merged_gdf.iterrows():
+            x, y = row['geometry'].centroid.coords.xy
+            ax.text(x[0], y[0], row['STUSPS'], fontsize=9, fontweight='bold',
+                    ha='center', va='center', color='black')
+
+    plt.tight_layout()
+    plt.show()
+```
+
+```{python}
+#| warning: false
+#| message: false
+import os
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import requests
+import zipfile
+import io
+import tempfile
+import warnings
+import matplotlib.patches as mpatches
+
+
+warnings.filterwarnings("ignore", message=".*Tight layout not applied.*")
+
+def EB_county_map(df, summary_df):
+        threshold = 0.5
+
+        summary_df = summary_df.dropna(subset=['state', 'mean_ebres', 'median_ebres'])
+        df = df.merge(summary_df[['state', 'mean_ebres', 'median_ebres']], on='state', how='left')
+
+        df['county_color_mean'] = df['EBres'].lt(df['mean_ebres']).map({True: 'Below', False: 'Above'})
+        df['county_color_median'] = df['EBres'].lt(df['median_ebres']).map({True: 'Below', False: 'Above'})
+        df['difference_from_mean'] = df['EBres'] - df['mean_ebres']
+        df['difference_from_median'] = df['EBres'] - df['median_ebres']
+        df['difference_from_median'] = df['difference_from_median'].clip(lower=-threshold, upper=threshold)
+
+        url = 'https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_county_20m.zip'
+        response = requests.get(url)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "counties.zip")
+            with open(zip_path, "wb") as f:
+                f.write(response.content)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(tmpdir)
+                shp_file = [f for f in z.namelist() if f.endswith('.shp')][0]
+                shp_path = os.path.join(tmpdir, shp_file)
+                counties = gpd.read_file(shp_path)
+
+        # Exclude Alaska (02), Hawaii (15), Puerto Rico (72)
+        counties = counties[~counties['STATEFP'].isin(['02', '15', '72'])]
+        df['fips'] = df['fips'].astype(str).str.zfill(5)
+        counties['fips'] = counties['STATEFP'] + counties['COUNTYFP']
+        counties = counties.merge(df, on='fips', how='left')
+        cat_cmap = {'Above': 'orange', 'Below': 'green'}
+        cont_cmap = plt.cm.get_cmap('RdYlGn_r')
+        # Plot 1: Above/Below State Mean
+        # fig1, ax1 = plt.subplots(figsize=(12, 8))
+        # color_map = {'Above': 'orange', 'Below': 'green'}
+        # counties['color_mean'] = counties['county_color_mean'].map(color_map)
+        # counties['color_mean'] = counties['color_mean'].fillna('#dddddd') 
+        # counties.plot(color=counties['color_mean'], ax=ax1, edgecolor='none')
+        # patches = [
+        # mpatches.Patch(color='green', label='Below'),
+        # mpatches.Patch(color='orange', label='Above'),
+        # mpatches.Patch(color='#dddddd', label='Missing')
+        #  ]
+        # ax1.legend(handles=patches, title="Energy Burden")
+        
+        
+        # ax1.set_title("Energy Burden % (Above/Below State Mean)")
+        # ax1.axis('off')
+        # patches = [mpatches.Patch(color=v, label=k) for k, v in color_map.items()]
+        # ax1.legend(handles=patches, title="Energy Burden")
+
+        # # Plot 2: Above/Below State Median
+        # fig2, ax2 = plt.subplots(figsize=(12, 8))
+        # counties['color_median'] = counties['county_color_median'].map(color_map)
+        # counties['color_median'] = counties['color_median'].fillna('#dddddd') 
+        # counties.plot(color=counties['color_median'], ax=ax2, edgecolor='none')
+        # ax2.set_title("Energy Burden % (Above/Below State Median)")
+        # ax2.axis('off')
+        # patches = [mpatches.Patch(color=v, label=k) for k, v in color_map.items()]
+        # ax2.legend(handles=patches, title="Energy Burden")
+
+        # Plot 3: Gradient from State Mean
+        fig3, ax3 = plt.subplots(figsize=(12, 8))
+        counties.plot(column='difference_from_mean', cmap=cont_cmap, legend=True,
+                    legend_kwds={'label': "Diff from Mean"},
+                    ax=ax3, edgecolor='none')
+        ax3.set_title("Energy Burden % (Difference from State Mean)")
+        ax3.axis('off')
+
+        # Plot 4: Gradient from State Median (Clipped)
+        fig4, ax4 = plt.subplots(figsize=(12, 8))
+        counties.plot(column='difference_from_median', cmap=cont_cmap, legend=True,
+                    legend_kwds={'label': "Diff from Median (Clipped)"},
+                    ax=ax4, edgecolor='none')
+        ax4.set_title("Energy Burden % (Difference from State Median, Clipped Range)")
+        ax4.axis('off')
+
+        plt.show()
+```
+
+```{python}
+#| warning: false
+#| message: false
+from statsmodels.distributions.empirical_distribution import ECDF
+
+def plot_energy_burden_distribution(df, column="EBres", year_label="2025"):
+    
+    ebres = df[column].dropna()
+    if ebres.empty:
+        print(f"No data available in column '{column}' for year {year_label}.")
+        return
+    
+    percentiles = np.percentile(ebres, [25, 50, 75, 90])
+    p25, p50, p75, p90 = percentiles
+
+    # Distribution PDF
+    plt.figure(figsize=(10, 6))
+    sns.histplot(ebres, bins=70, color="#1f77b4", edgecolor="black", alpha=0.7)
+    plt.axvline(p90, color='red', linestyle='dashed', linewidth=1)
+    plt.text(4.5, 175, f"Above the 90th percentile ({round(p90, 2)}%)", color='red', ha='right', size=10)
+    plt.title(f"Energy Burden Distribution Across US Counties {year_label}")
+    plt.xlabel("Energy Burden (%)")
+    plt.ylabel("Count of Counties")
+    plt.xlim(0, 5.5)
+    sns.despine()
+    plt.tight_layout()
+    plt.show()
+
+    # Cumulative CDF
+    ecdf = ECDF(ebres)
+
+    plt.figure(figsize=(10, 6))
+    plt.step(ecdf.x, ecdf.y, color="#4C90B1", linewidth=1.5)
+    for val in [p25, p50, p75]:
+        plt.axvline(val, color="#2CA02C", linestyle="dashed", linewidth=1)
+    plt.axvline(p90, color="#FF7F0E", linestyle="dashed", linewidth=1)
+
+    plt.text(3.5, 0.8, f"≥ 90th percentile: {round(p90, 2)}%", color="#FF7F0E", size=10)
+    plt.text(p25 - 0.5, 0.3, f"25%: {round(p25, 2)}", color="#2CA02C", size=10)
+    plt.text(p50, 0.8, f"50%: {round(p50, 2)}", color="#2CA02C", size=10)
+    plt.text(p75, 0.9, f"75%: {round(p75, 2)}", color="#2CA02C", size=10)
+
+    plt.title(f"Cumulative Distribution of Energy Burden Across US Counties {year_label}")
+    plt.xlabel("Energy Burden (%)")
+    plt.ylabel("Cumulative Proportion")
+    plt.xlim(0, 5.0)
+    sns.despine()
+    plt.tight_layout()
+    plt.show()
+
+    # Boxplot
+    plt.figure(figsize=(10, 2))
+    sns.boxplot(x=ebres, color="#1f77b4", fliersize=3)
+    plt.axvline(p90, color='red', linestyle='dashed', linewidth=1)
+    plt.text(p90, 0.1, f"90th percentile ({round(p90, 2)}%)", color='red', ha='left', size=10)
+
+    plt.title(f"Boxplot of Energy Burden Across US Counties {year_label}")
+    plt.xlabel("Energy Burden (%)")
+    plt.yticks([])
+    sns.despine(left=True)
+    plt.tight_layout()
+    plt.show()
+
+    # Summary Statistics
+    print(f"\nSummary Statistics for {column} in {year_label}:")
+    print(ebres.describe())
+
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+res2025 = generate_EBres_summary(df2025btm, year_label="2025")
+summary_EBres_2025 = res2025['summary']
+plot_list_2025 = res2025['plots']
+EB_heatmap(summary_EBres_2025)
+EB_county_map(df2025btm, summary_EBres_2025)
+plot_energy_burden_distribution(df2025btm, column="EBres", year_label="2025")
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+res2035 = generate_EBres_summary(df2035btm, year_label="2035")
+summary_EBres_2035 = res2035['summary']
+plot_list_2035 = res2035['plots']
+EB_heatmap(summary_EBres_2035)
+EB_county_map(df2035btm, summary_EBres_2035)
+plot_energy_burden_distribution(df2035btm, column="EBres", year_label="2035")
+
+```
+
+Data from Python is the same as R.
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_energy_burden_summary(df, year):
+      
+    ebres = df["EBres"].dropna()
+    percent_90 = round(np.percentile(ebres, 90), 2)
+
+   
+    df_above_90 = df[df["EBres"] >= percent_90]
+    above_90_counts = df_above_90["state"].value_counts().reset_index()
+    above_90_counts.columns = ["state", "above_90"]
+
+    total_counts = df["state"].value_counts().reset_index()
+    total_counts.columns = ["state", "total"]
+
+   
+    percentage_df = pd.merge(above_90_counts, total_counts, on="state", how="left")
+    percentage_df["percentage"] = (percentage_df["above_90"] / percentage_df["total"]) * 100
+
+    
+    percentage_df_sorted = percentage_df.sort_values("percentage", ascending=True)
+
+   
+    plt.figure(figsize=(10, 6))
+    sns.barplot(
+        data=above_90_counts.sort_values("above_90"),
+        x="above_90", y="state",
+        color="darkseagreen", edgecolor="seagreen", alpha=0.8
+    )
+    plt.title(f"Counties Above 90th Percentile of Energy Burden by State ({year})", fontsize=14, weight="bold")
+    plt.xlabel("Number of Counties")
+    plt.ylabel("State")
+    sns.despine()
+    plt.tight_layout()
+    plt.show()
+
+    
+    plt.figure(figsize=(10, 6))
+    ax = sns.barplot(
+        data=percentage_df_sorted,
+        x="percentage", y="state",
+        color="lightblue", edgecolor="steelblue", alpha=0.85
+    )
+
+   
+    for bar in ax.patches:
+        width = bar.get_width()
+        y = bar.get_y() + bar.get_height() / 2
+        ax.text(width + 0.5, y, f"{width:.1f}%", va='center', ha='left', fontsize=9)
+
+    plt.title(f"Percentage of Counties ≥ 90th Percentile Energy Burden by State ({year})", fontsize=14, weight="bold")
+    plt.xlabel("Percentage of Counties (%)")
+    plt.ylabel("State")
+    plt.xlim(0, percentage_df_sorted["percentage"].max() + 10)
+    sns.despine()
+    plt.tight_layout()
+    plt.show()
+    #print(percentage_df)
+
+   
+
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+plot_energy_burden_summary(df2025btm, year=2025)
+```
+
+```{python}
+#| warning: false
+#| message: false
+plot_energy_burden_summary(df2035btm, year=2035)
+```
+
+## 3.2 $EB_{GDP}$ and $NER_{GDP}$ (at a county level)
+
+```{python}
+#| warning: false
+#| message: false
+def generate_energy_gdp_summary(df, year_label="Year"):
+    states = df['state'].dropna().unique()
+    states = [state for state in states if state != "DC"]
+
+    plot_list = []
+    summary_energy_gdp = []
+
+    for state in states:
+        state_data = df[(df['state'] == state) & (df['energy_gdp'].notna())]
+
+        if state_data.empty:
+            continue
+
+        mean_state = state_data['energy_gdp'].mean()
+        median_state = state_data['energy_gdp'].median()
+        sd_state = state_data['energy_gdp'].std()
+        perc90 = state_data['energy_gdp'].quantile(0.9)
+
+        summary_energy_gdp.append({
+            'state': state,
+            'mean_energy_gdp': mean_state,
+            'median_energy_gdp': median_state,
+            'sd_energy_gdp': sd_state
+        })
+
+        plt.figure(figsize=(8, 6))
+        ax = sns.histplot(state_data['energy_gdp'], bins=15, color="darkseagreen", edgecolor="darkseagreen", alpha=0.7)
+        plt.axvline(median_state, color="black", linestyle="--", linewidth=1)
+        plt.axvline(perc90, color="red", linestyle="--", linewidth=1)
+
+        plt.title(f"Energy GDP Distribution in {state} - {year_label}", fontsize=16)
+        plt.xlabel("Energy GDP (%)", fontsize=14)
+        plt.ylabel("Count of Counties", fontsize=14)
+        plt.text(median_state - median_state / 5, 10, f"Median: {median_state:.2f}", color="black", fontsize=10)
+        plt.text(median_state - median_state / 5, 9, f"90th Percentile: {perc90:.2f}", color="red", fontsize=10)
+
+        plt.tight_layout()
+        plot_list.append(plt.gcf())
+        plt.close()
+
+    summary_energy_gdp_df = pd.DataFrame(summary_energy_gdp)
+    summary_energy_gdp_df = summary_energy_gdp_df.sort_values(by='mean_energy_gdp', ascending=False)
+
+    national_mean = summary_energy_gdp_df['mean_energy_gdp'].mean()
+    national_median = summary_energy_gdp_df['median_energy_gdp'].median()
+
+    summary_energy_gdp_df['mean_comparison'] = summary_energy_gdp_df['mean_energy_gdp'].apply(lambda x: 'Above' if x > national_mean else 'Below')
+    summary_energy_gdp_df['median_comparison'] = summary_energy_gdp_df['median_energy_gdp'].apply(lambda x: 'Above' if x > national_median else 'Below')
+
+    return {
+        'summary': summary_energy_gdp_df,
+        'plots': plot_list
+    }
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+def energy_gdp_heatmap(df_summary):
+    national_median = df_summary['median_energy_gdp'].median()
+    national_mean = df_summary['mean_energy_gdp'].mean()
+    df_summary = df_summary.copy()
+    df_summary['difference_from_median'] = df_summary['median_energy_gdp'] - national_median
+    df_summary['difference_from_mean'] = df_summary['mean_energy_gdp'] - national_mean
+
+    response = requests.get('https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_state_20m.zip')
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        zip_path = os.path.join(tmpdirname, "cb_2020_us_state_20m.zip")
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmpdirname)
+            shapefile_name = [f for f in z.namelist() if f.endswith('.shp')][0]
+            shapefile_path = os.path.join(tmpdirname, shapefile_name)
+            states_gdf = gpd.read_file(shapefile_path)
+
+    states_gdf = states_gdf[~states_gdf['STUSPS'].isin(['AK', 'HI', 'PR'])]
+
+    merged_gdf = states_gdf.merge(df_summary, left_on='STUSPS', right_on='state', how='left')
+
+    cmap = plt.cm.get_cmap('RdYlGn_r')
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 16))  
+
+    # Difference from median
+    vmin_median, vmax_median = merged_gdf['difference_from_median'].min(), merged_gdf['difference_from_median'].max()
+    norm_median = mcolors.TwoSlopeNorm(vmin=vmin_median, vcenter=0, vmax=vmax_median)
+    merged_gdf.plot(column='difference_from_median', cmap=cmap, norm=norm_median,
+                    linewidth=0.8, edgecolor='black', ax=axes[0], legend=True)
+    axes[0].set_title('Energy GDP % by State\n(Difference from National Median)', fontsize=14)
+    axes[0].axis('off')
+
+    # Difference from mean
+    vmin_mean, vmax_mean = merged_gdf['difference_from_mean'].min(), merged_gdf['difference_from_mean'].max()
+    norm_mean = mcolors.TwoSlopeNorm(vmin=vmin_mean, vcenter=0, vmax=vmax_mean)
+    merged_gdf.plot(column='difference_from_mean', cmap=cmap, norm=norm_mean,
+                    linewidth=0.8, edgecolor='black', ax=axes[1], legend=True)
+    axes[1].set_title('Energy GDP % by State\n(Difference from National Mean)', fontsize=14)
+    axes[1].axis('off')
+
+    for ax in axes:
+        for idx, row in merged_gdf.iterrows():
+            x, y = row['geometry'].centroid.coords.xy
+            ax.text(x[0], y[0], row['STUSPS'], fontsize=9, fontweight='bold',
+                    ha='center', va='center', color='black')
+
+    plt.tight_layout()
+    plt.show()
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+def energy_gdp_county_map(df, summary_df):
+    threshold = 0.5
+
+    summary_df = summary_df.dropna(subset=['state', 'mean_energy_gdp', 'median_energy_gdp'])
+    df = df.merge(summary_df[['state', 'mean_energy_gdp', 'median_energy_gdp']], on='state', how='left')
+
+    df['county_color_mean'] = df['energy_gdp'].lt(df['mean_energy_gdp']).map({True: 'Below', False: 'Above'})
+    df['county_color_median'] = df['energy_gdp'].lt(df['median_energy_gdp']).map({True: 'Below', False: 'Above'})
+    df['difference_from_mean'] = df['energy_gdp'] - df['mean_energy_gdp']
+    df['difference_from_median'] = df['energy_gdp'] - df['median_energy_gdp']
+    df['difference_from_median'] = df['difference_from_median'].clip(lower=-threshold, upper=threshold)
+
+    url = 'https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_county_20m.zip'
+    response = requests.get(url)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "counties.zip")
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmpdir)
+            shp_file = [f for f in z.namelist() if f.endswith('.shp')][0]
+            shp_path = os.path.join(tmpdir, shp_file)
+            counties = gpd.read_file(shp_path)
+
+    counties = counties[~counties['STATEFP'].isin(['02', '15', '72'])]
+    df['fips'] = df['fips'].astype(str).str.zfill(5)
+    counties['fips'] = counties['STATEFP'] + counties['COUNTYFP']
+    counties = counties.merge(df, on='fips', how='left')
+
+    cont_cmap = plt.cm.get_cmap('RdYlGn_r')
+
+    # Plot 3: Gradient from State Mean
+    fig3, ax3 = plt.subplots(figsize=(12, 8))
+    counties.plot(column='difference_from_mean', cmap=cont_cmap, legend=True,
+                legend_kwds={'label': "Diff from Mean"},
+                ax=ax3, edgecolor='none')
+    ax3.set_title("Energy GDP % (Difference from State Mean)")
+    ax3.axis('off')
+
+    # Plot 4: Gradient from State Median (Clipped)
+    fig4, ax4 = plt.subplots(figsize=(12, 8))
+    counties.plot(column='difference_from_median', cmap=cont_cmap, legend=True,
+                legend_kwds={'label': "Diff from Median (Clipped)"},
+                ax=ax4, edgecolor='none')
+    ax4.set_title("Energy GDP % (Difference from State Median, Clipped Range)")
+    ax4.axis('off')
+
+    plt.show()
+```
+
+```{python}
+#| warning: false
+#| message: false
+result = generate_energy_gdp_summary(df2025btm)
+summary_df = result['summary']
+plots = result['plots']
+energy_gdp_county_map(df2025btm, summary_df)
+```
+
+```{python}
+#| warning: false
+#| message: false
+result = generate_energy_gdp_summary(df2035btm)
+summary_df = result['summary']
+plots = result['plots']
+energy_gdp_county_map(df2035btm, summary_df)
+```
+
+Values are coincident for R and Python.
+
+## 3.3 AEP-to-demand ratio
+
+Since the literature talk about more AEP. we need to check the distribution of AEP/demand and compare to AEP non standarized. First we check the distribution.
+
+```{python}
+#| warning: false
+#| message: false
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import ks_2samp, zscore
+
+def plot_histograms(df, label):
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    ks_stat, p_value = ks_2samp(df['aep_demand'], df['cost_viable_aep_sum_twh'])
+
+    # AEP Demand standarized
+    sns.histplot(
+        df['aep_demand'],
+        bins=int((df['aep_demand'].max() - df['aep_demand'].min()) / 0.00001),
+        ax=axes[0],
+        color="#1f77b4",
+        edgecolor="black",
+        alpha=0.7
+    )
+    axes[0].set_title(f"AEP/Demand (TWh/TWh) - {label}", fontsize=14, fontweight="bold")
+    axes[0].set_xlabel("AEP Demand", fontsize=12)
+    axes[0].set_ylabel("Frequency", fontsize=12)
+    axes[0].tick_params(axis='x', labelrotation=45)
+    axes[0].set_title(f"AEP/Demand (TWh/TWh) - {label}")
+    axes[0].text(0.5, -0.2, f"Data Source: {label}", transform=axes[0].transAxes,
+                 ha='center', fontsize=9, style='italic')
+    # Non standarized AEP.
+    sns.histplot(
+        df['cost_viable_aep_sum_twh'],
+        bins=int((df['cost_viable_aep_sum_twh'].max() - df['cost_viable_aep_sum_twh'].min()) / 0.01),
+        ax=axes[1],
+        color="#ff7f0e",
+        edgecolor="black",
+        alpha=0.7
+    )
+    axes[1].set_title(f"AEP in TWh - {label}", fontsize=14, fontweight="bold")
+    axes[1].set_xlabel("Economic AEP (TWh)", fontsize=12)
+    axes[1].set_ylabel("Frequency", fontsize=12)
+    axes[1].tick_params(axis='x', labelrotation=45)
+    axes[1].set_title(f"AEP in TWh - {label}\nThe total Cost Viable AEP in TWh")
+    axes[1].text(0.5, -0.2, f"Data Source: {label}", transform=axes[1].transAxes,
+                 ha='center', fontsize=9, style='italic')
+
+    print(f"[{label}] Kolmogorov–Smirnov Test:")
+    print(f"  Statistic: {ks_stat:.4f}")
+    print(f"  p-value:   {p_value:.4f}")
+    if p_value < 0.05:
+        print("  → The distributions are significantly different (p < 0.05)")
+    else:
+        print("  → The distributions are NOT significantly different (p ≥ 0.05)")
+    
+    plt.tight_layout()
+    plt.show()
+
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+plot_histograms(df2025btm, '2025 BTM')
+plot_histograms(df2035btm, '2035 BTM')
+```
+
+```{python}
+#| warning: false
+#| message: false
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import boxcox_llf, boxcox, kstest
+
+def plot_boxcox_lambda_and_transform(df, demand_col, econ_col, label):
+    demand_data = df[demand_col][df[demand_col] > 0]
+    econ_data = df[econ_col][df[econ_col] > 0]
+    lambdas = np.linspace(-2, 2, 100)
+
+    llf_demand = [boxcox_llf(lmb, demand_data) for lmb in lambdas] #Log-likelihood to lambdas
+    llf_econ = [boxcox_llf(lmb, econ_data) for lmb in lambdas]
+
+    # Optimal lambdas (rounded to 1 decimal for display)
+    opt_lambda_demand = round(lambdas[np.argmax(llf_demand)], 1)
+    opt_lambda_econ = round(lambdas[np.argmax(llf_econ)], 1)
+
+    # Transform data using optimal lambdas
+    transformed_demand, _ = transform_boxcox(demand_data, 0.3)
+    transformed_econ, _ = transform_boxcox(econ_data, 0.2)
+
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Plot AEP Demand log-likelihood
+    axes[0].plot(lambdas, llf_demand, color="#1f77b4")
+    axes[0].axvline(opt_lambda_demand, color='red', linestyle='--')
+    axes[0].set_title(f"Box-Cox Trans for AEP Demand - {label}", fontsize=14, fontweight='bold')
+    axes[0].set_xlabel("Lambda", fontsize=12)
+    axes[0].set_ylabel("Log-Likelihood", fontsize=12)
+    axes[0].text(0.5, 0.9, f"Optimal Lambda = {opt_lambda_demand:.1f}", transform=axes[0].transAxes,
+                 ha='center', fontsize=11, style='italic')
+
+    # Plot Economic AEP log-likelihood
+    axes[1].plot(lambdas, llf_econ, color="#ff7f0e")
+    axes[1].axvline(opt_lambda_econ, color='red', linestyle='--')
+    axes[1].set_title(f"Box-Cox Trans for Economic AEP (TWh) - {label}", fontsize=14, fontweight='bold')
+    axes[1].set_xlabel("Lambda", fontsize=12)
+    axes[1].set_ylabel("Log-Likelihood", fontsize=12)
+    axes[1].text(0.5, 0.9, f"Optimal Lambda = {opt_lambda_econ:.1f}", transform=axes[1].transAxes,
+                 ha='center', fontsize=11, style='italic')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Return transformed columns and optimal lambdas for further use
+    return transformed_demand, transformed_econ, opt_lambda_demand, opt_lambda_econ
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+trans_demand2025, trans_econ_2025, lmd_2025_s, lmd_2025_ns = plot_boxcox_lambda_and_transform(df2025btm, 'aep_demand', 'cost_viable_aep_sum_twh', '2025 BTM')
+trans_demand2035, trans_econ_2035, lmd_2035_s, lmd_2035_ns = plot_boxcox_lambda_and_transform(df2035btm, 'aep_demand', 'cost_viable_aep_sum_twh', '2035 BTM')
+```
+
+```{python}
+#| warning: false
+#| message: false
+def plot_histograms_trans(transformed_demand, transformed_econ, label):
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Histogram for transformed AEP Demand
+    sns.histplot(transformed_demand, bins=30, color="#1f77b4", edgecolor="black", alpha=0.7, ax=axes[0])
+    axes[0].set_title(f"Box-Cox Transformed AEP Demand - {label}", fontsize=14, fontweight="bold")
+    axes[0].set_xlabel("Transformed AEP Demand", fontsize=12)
+    axes[0].set_ylabel("Frequency", fontsize=12)
+    axes[0].tick_params(axis='x', labelrotation=45)
+    axes[0].text(0.5, -0.2, f"Data Source: {label}", transform=axes[0].transAxes,
+                 ha='center', fontsize=9, style='italic')
+
+    # Histogram for transformed Economic AEP
+    sns.histplot(transformed_econ, bins=30, color="#ff7f0e", edgecolor="black", alpha=0.7, ax=axes[1])
+    axes[1].set_title(f"Box-Cox Transformed Economic AEP (TWh) - {label}", fontsize=14, fontweight="bold")
+    axes[1].set_xlabel("Transformed Economic AEP (TWh)", fontsize=12)
+    axes[1].set_ylabel("Frequency", fontsize=12)
+    axes[1].tick_params(axis='x', labelrotation=45)
+    axes[1].text(0.5, -0.2, f"Data Source: {label}", transform=axes[1].transAxes,
+                 ha='center', fontsize=9, style='italic')
+
+    plt.tight_layout()
+    plt.show()
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+from scipy.stats import ks_2samp
+
+def ks_test_on_transformed(transformed_demand, transformed_econ):
+    ks_stat, p_value = ks_2samp(transformed_demand, transformed_econ)
+    print(f"KS Statistic: {ks_stat:.4f}")
+    print(f"P-value: {p_value:.4f}")
+
+    if p_value < 0.05:
+        print("Distributions are significantly different (reject H0).")
+    else:
+        print("No significant difference between distributions (fail to reject H0).")
+```
+
+```{python}
+#| warning: false
+#| message: false
+plot_histograms_trans(trans_demand2025, trans_econ_2025, '2025 BTM')
+ks_test_on_transformed(trans_demand2025, trans_econ_2025)
+
+plot_histograms_trans(trans_demand2035, trans_econ_2035, '2035 BTM')
+ks_test_on_transformed(trans_demand2035, trans_econ_2035)
+```
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_aep_demand_distribution(df, title=None):
+    df = df.copy()
+
+    # Compute median and classify
+    aep_median = df['aep_demand'].median(skipna=True)
+    df['aep_category'] = np.where(df['aep_demand'] > aep_median, 'Above Median', 'Below Median')
+
+    # Count and percent per state
+    count_df = (
+        df.dropna(subset=['state', 'aep_category'])
+          .groupby(['state', 'aep_category'])
+          .size()
+          .reset_index(name='n')
+    )
+    count_df['total'] = count_df.groupby('state')['n'].transform('sum')
+    count_df['pct'] = count_df['n'] / count_df['total'] * 100
+    count_df['pct_plot'] = np.where(
+        count_df['aep_category'] == 'Below Median',
+        -count_df['pct'],
+        count_df['pct']
+    )
+
+    ### --- ALL STATES PLOT --- ###
+    # Sort states by % Above Median
+    sorted_states = (
+        count_df[count_df['aep_category'] == 'Above Median']
+        .sort_values(by='pct', ascending=False)['state']
+        .dropna()
+        .unique()
+    )
+    count_df['state'] = pd.Categorical(count_df['state'], categories=sorted_states, ordered=True)
+
+    plt.figure(figsize=(10, max(6, len(sorted_states) * 0.3)))
+    sns.barplot(
+        data=count_df,
+        y='state',
+        x='pct_plot',
+        hue='aep_category',
+        dodge=False,
+        palette={'Above Median': '#1f77b4', 'Below Median': 'red'},
+        edgecolor='black',
+        alpha=0.85
+    )
+    plt.xlabel("Percentage of Counties")
+    plt.ylabel("State")
+    plt.xticks(
+        ticks=plt.xticks()[0],
+        labels=[f"{abs(int(x))}%" for x in plt.xticks()[0]]
+    )
+    plt.legend(title="AEP Demand", loc='upper right')
+    if title:
+        plt.title(f"{title} (All States)")
+    plt.grid(True, axis='x', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+    ### --- TOP 10 STATES ONLY --- ###
+    # Get top 10 states based on "Above Median" pct
+    top10_states = (
+        count_df[count_df['aep_category'] == 'Above Median']
+        .sort_values(by='pct', ascending=False)
+        .head(10)['state']
+        .dropna()
+        .tolist()
+    )
+
+    count_top10 = count_df[count_df['state'].isin(top10_states)].copy()
+    count_top10['state'] = pd.Categorical(
+        count_top10['state'],
+        categories=top10_states,
+        ordered=True
+    )
+
+    plt.figure(figsize=(10, max(6, len(top10_states) * 0.6)))
+    sns.barplot(
+        data=count_top10,
+        y='state',
+        x='pct_plot',
+        hue='aep_category',
+        dodge=False,
+        palette={'Above Median': '#1f77b4', 'Below Median': 'red'},
+        edgecolor='black',
+        alpha=0.85
+    )
+    plt.xlabel("Percentage of Counties")
+    plt.ylabel("State")
+    plt.xticks(
+        ticks=plt.xticks()[0],
+        labels=[f"{abs(int(x))}%" for x in plt.xticks()[0]]
+    )
+    plt.legend(title="AEP Demand", loc='upper right')
+    if title:
+        plt.title(f"{title} (Top 10 States Only)")
+    plt.grid(True, axis='x', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+plot_aep_demand_distribution(df2025btm, title="AEP Demand Distribution - 2025")
+plot_aep_demand_distribution(df2035btm, title="AEP Demand Distribution - 2035")
+```
+
+AEP Residential demand
+
+```{python}
+#| warning: false
+#| message: false
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import ks_2samp
+
+def plot_aepRES_histogram(df, label):
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    sns.histplot(
+        df['aepRES_demand'],
+        bins=int((df['aepRES_demand'].max() - df['aepRES_demand'].min()) / 0.00001),
+        color="#1f77b4",
+        edgecolor="black",
+        alpha=0.7,
+        ax=ax
+    )
+    ax.set_title(f"AEPRES/Demand (TWh/TWh) - {label}", fontsize=14, fontweight="bold")
+    ax.set_xlabel("AEPRES Demand", fontsize=12)
+    ax.set_ylabel("Frequency", fontsize=12)
+    ax.tick_params(axis='x', labelrotation=45)
+    ax.text(0.5, -0.2, f"Data Source: {label}", transform=ax.transAxes,
+            ha='center', fontsize=9, style='italic')
+
+    plt.tight_layout()
+    plt.show()
+def plot_aepRES_boxcox_histogram(transformed_aep, label):
+    sns.set_theme(style="whitegrid")
+    plt.figure(figsize=(8, 6))
+    sns.histplot(transformed_aep, bins=30, color="#1f77b4", edgecolor="black", alpha=0.7)
+    plt.title(f"Box-Cox Transformed AEPRES Demand - {label}", fontsize=14, fontweight="bold")
+    plt.xlabel("Transformed AEPRES Demand", fontsize=12)
+    plt.ylabel("Frequency", fontsize=12)
+    plt.xticks(rotation=45)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+def ks_test_transformed_aepRES(transformed_aep, label):
+    # Compare transformed AEPRES against a normal distribution
+    from scipy.stats import norm
+
+    ks_stat, p_value = ks_2samp(transformed_aep, norm.rvs(size=len(transformed_aep), random_state=42))
+    print(f"[{label}] KS Test vs. Normal Distribution")
+    print(f"  KS Statistic: {ks_stat:.4f}")
+    print(f"  p-value:      {p_value:.4f}")
+    if p_value < 0.05:
+        print("  → Significantly different from normal (p < 0.05)")
+    else:
+        print("  → Not significantly different from normal (p ≥ 0.05)")
+def plot_aepRES_demand_distribution(df, title=None):
+    df = df.copy()
+
+    # Compute median and classify
+    aep_median = df['aepRES_demand'].median(skipna=True)
+    df['aep_category'] = np.where(df['aepRES_demand'] > aep_median, 'Above Median', 'Below Median')
+
+    # Count and percent per state
+    count_df = (
+        df.dropna(subset=['state', 'aep_category'])
+          .groupby(['state', 'aep_category'])
+          .size()
+          .reset_index(name='n')
+    )
+    count_df['total'] = count_df.groupby('state')['n'].transform('sum')
+    count_df['pct'] = count_df['n'] / count_df['total'] * 100
+    count_df['pct_plot'] = np.where(
+        count_df['aep_category'] == 'Below Median',
+        -count_df['pct'],
+        count_df['pct']
+    )
+
+    # Sort states by % Above Median
+    sorted_states = (
+        count_df[count_df['aep_category'] == 'Above Median']
+        .sort_values(by='pct', ascending=False)['state']
+        .dropna()
+        .unique()
+    )
+    count_df['state'] = pd.Categorical(count_df['state'], categories=sorted_states, ordered=True)
+
+    plt.figure(figsize=(10, max(6, len(sorted_states) * 0.3)))
+    sns.barplot(
+        data=count_df,
+        y='state',
+        x='pct_plot',
+        hue='aep_category',
+        dodge=False,
+        palette={'Above Median': '#1f77b4', 'Below Median': 'red'},
+        edgecolor='black',
+        alpha=0.85
+    )
+    plt.xlabel("Percentage of Counties")
+    plt.ylabel("State")
+    plt.xticks(
+        ticks=plt.xticks()[0],
+        labels=[f"{abs(int(x))}%" for x in plt.xticks()[0]]
+    )
+    plt.legend(title="AEPRES Demand", loc='upper right')
+    if title:
+        plt.title(f"{title} (All States)")
+    plt.grid(True, axis='x', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.show()
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+
+plot_aepRES_histogram(df2025btm, "2025 BTM")
+plot_aepRES_histogram(df2035btm, "2035 BTM")
+
+# Box-Cox 
+plot_aepRES_boxcox_histogram(df2025btm['aepRES_demand_boxcox'], "2025 BTM")
+plot_aepRES_boxcox_histogram(df2035btm['aepRES_demand_boxcox'], "2035 BTM")
+# KS test against normal distribution
+ks_test_transformed_aepRES(df2025btm['aepRES_demand_boxcox'], "2025 BTM")
+ks_test_transformed_aepRES(df2035btm['aepRES_demand_boxcox'], "2035 BTM")
+
+plot_aepRES_demand_distribution(df2025btm, title="AEPRES Demand Distribution - 2025")
+plot_aepRES_demand_distribution(df2035btm, title="AEPRES Demand Distribution - 2035")
+
+```
+
+## 3.4 Correlations between metrics
+
+```{python}
+#| warning: false
+#| message: false
+def kendall_tau_a(x, y):
+    n = len(x)
+    concordant = discordant = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            concordant += (x[i] - x[j]) * (y[i] - y[j]) > 0
+            discordant += (x[i] - x[j]) * (y[i] - y[j]) < 0
+    return (concordant - discordant) / (0.5 * n * (n - 1))
+```
+
+### AEP-Demand (Residential) to Energy Burden.
+
+State level
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import requests, zipfile, os, tempfile
+from scipy.stats import pearsonr, kendalltau
+
+def compute_aepres_eb_correlations(df):
+    df = df.copy()
+
+    # Clean Box-Cox transformed data for Pearson
+    clean_log = df[
+        (~df['aepRES_demand_boxcox'].isna()) &
+        (~df['EBres_boxcox'].isna()) &
+        (~df['aepRES_demand_boxcox'].isin([np.inf, -np.inf])) &
+        (df['aepRES_demand'] > 0)
+    ][['aepRES_demand_boxcox', 'EBres_boxcox', 'state']]
+
+    # Clean original (non-transformed) for Kendall
+    clean_nc = df[
+        (~df['aepRES_demand'].isna()) &
+        (~df['EBres'].isna())
+    ][['aepRES_demand', 'EBres', 'state']]
+
+    states = df['state'].dropna().unique()
+
+    pearson_corrs = []
+    kendall_corrs = []
+
+    for state in states:
+        sub_log = clean_log[clean_log['state'] == state]
+        sub_nc = clean_nc[clean_nc['state'] == state]
+
+        # Pearson
+        if len(sub_log) > 2 and sub_log['aepRES_demand_boxcox'].std() > 0:
+            r, _ = pearsonr(sub_log['aepRES_demand_boxcox'], sub_log['EBres_boxcox'])
+            pearson_corrs.append(r)
+        else:
+            pearson_corrs.append(np.nan)
+
+        # Kendall
+        if len(sub_nc) > 2 and sub_nc['aepRES_demand'].std() > 0:
+            tau = kendall_tau_a(sub_nc['aepRES_demand'], sub_nc['EBres'])
+            kendall_corrs.append(tau)
+        else:
+            kendall_corrs.append(np.nan)
+
+    corr_df = pd.DataFrame({
+        'state': states,
+        'pearson': pearson_corrs,
+        'kendall': kendall_corrs,
+    })
+    corr_df['difference'] = (corr_df['pearson'] - corr_df['kendall']).abs()
+
+    return corr_df
+
+```
+
+
+
+```{python}
+#| warning: false
+#| message: false
+def compute_aepres_eb_correlations(df):
+    df = df.copy()
+
+    # Drop rows where aepRES_demand is missing or <= 0
+    df = df[df['aepRES_demand'].notna() & (df['aepRES_demand'] > 0)]
+
+    # Clean for Pearson (Box-Cox transformed data)
+    clean_log = df[
+        df['aepRES_demand_boxcox'].notna() &
+        df['EBres_boxcox'].notna() &
+        ~df['aepRES_demand_boxcox'].isin([np.inf, -np.inf])
+    ][['aepRES_demand_boxcox', 'EBres_boxcox', 'state']]
+
+    # Clean for Kendall (untransformed)
+    clean_nc = df[
+        df['EBres'].notna()
+    ][['aepRES_demand', 'EBres', 'state']]
+
+    states = df['state'].dropna().unique()
+
+    pearson_corrs = []
+    kendall_corrs = []
+
+    for state in states:
+        sub_log = clean_log[clean_log['state'] == state]
+        sub_nc = clean_nc[clean_nc['state'] == state]
+
+        if len(sub_log) > 2 and sub_log['aepRES_demand_boxcox'].std() > 0:
+            r, _ = pearsonr(sub_log['aepRES_demand_boxcox'], sub_log['EBres_boxcox'])
+            pearson_corrs.append(r)
+        else:
+            pearson_corrs.append(np.nan)
+
+        if len(sub_nc) > 2 and sub_nc['aepRES_demand'].std() > 0:
+            tau = kendall_tau_a(sub_nc['aepRES_demand'].to_numpy(), sub_nc['EBres'].to_numpy())
+            kendall_corrs.append(tau)
+        else:
+            kendall_corrs.append(np.nan)
+
+    corr_df = pd.DataFrame({
+        'state': states,
+        'pearson': pearson_corrs,
+        'kendall': kendall_corrs
+    })
+    corr_df['difference'] = (corr_df['pearson'] - corr_df['kendall']).abs()
+    return corr_df
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+from matplotlib.colors import LinearSegmentedColormap
+
+def plot_state_corr_map(corr_df, method='pearson', title_prefix='Correlation'):
+    # Load US states shapefile (same method as your EB map)
+    response = requests.get('https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_state_20m.zip')
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        zip_path = os.path.join(tmpdirname, "cb_2020_us_state_20m.zip")
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmpdirname)
+            shapefile_name = [f for f in z.namelist() if f.endswith('.shp')][0]
+            shapefile_path = os.path.join(tmpdirname, shapefile_name)
+            states_gdf = gpd.read_file(shapefile_path)
+
+    
+    states_gdf = states_gdf[~states_gdf['STUSPS'].isin(['AK', 'HI', 'PR'])]
+
+   
+    merged = states_gdf.merge(corr_df, left_on='STUSPS', right_on='state', how='left')
+
+    r_style_cmap = LinearSegmentedColormap.from_list(
+    "r_style_diverging", ["#00FF00", "#FFFFFF", "#800080"], N=256
+)
+    cmap = r_style_cmap
+    norm = mcolors.TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    merged.plot(column=method, cmap=cmap, norm=norm,
+                linewidth=0.8, edgecolor='black', ax=ax, legend=True)
+
+    ax.set_title(f"{title_prefix} ({method.capitalize()}) between AEPRES and EBres", fontsize=14)
+    ax.axis('off')
+
+    for idx, row in merged.iterrows():
+        try:
+            centroid = row['geometry'].centroid
+            ax.text(centroid.x, centroid.y, row['STUSPS'], ha='center', va='center',
+                    fontsize=8, fontweight='bold', color='black')
+        except:
+            continue
+
+    plt.tight_layout()
+    plt.show()
+
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corr2025 = compute_aepres_eb_correlations(df2025btm)
+corr2035 = compute_aepres_eb_correlations(df2035btm)
+
+plot_state_corr_map(corr2025, method='pearson', title_prefix='2025 BTM Correlation')
+plot_state_corr_map(corr2025, method='kendall', title_prefix='2025 BTM Correlation')
+
+plot_state_corr_map(corr2035, method='pearson', title_prefix='2035 BTM Correlation')
+plot_state_corr_map(corr2035, method='kendall', title_prefix='2035 BTM Correlation')
+
+```
+
+Correlations are the same in python oand R. The only diference in ranking 3 and 2 at 2025 kendall due to a rounding.
+
+
+### Rankings
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+
+def rank_states_by_demand(df_demand, decoder_ring):
+    # Join with decoder ring on 'fips' to get state info
+    df_with_state = df_demand.merge(decoder_ring, on='fips', how='left')
+
+    # Group by state and summarize
+    state_summary = (
+        df_with_state
+        .groupby('state', as_index=False)
+        .agg({
+            'Residential_tWh': 'sum',
+            'total_tWh': 'sum'
+        })
+    )
+
+    # Filter out NA residential values and exclude Hawaii (HI)
+    state_summary = state_summary[
+        state_summary['Residential_tWh'].notna() & (state_summary['state'] != 'HI')
+    ]
+
+    # Rank and sort
+    state_summary['rank_residential_dem'] = state_summary['Residential_tWh'].rank(ascending=False, method='min')
+    state_summary['rank_total_dem'] = state_summary['total_tWh'].rank(ascending=False, method='min')
+
+    # Select and sort columns
+    ranked_states = (
+        state_summary
+        .sort_values(by='Residential_tWh', ascending=False)
+        [['state', 'Residential_tWh', 'rank_residential_dem', 'total_tWh', 'rank_total_dem']]
+    )
+
+    return ranked_states
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+
+# Apply the function to 2025 and 2035 data
+rank_states25 = rank_states_by_demand(df_demand2025, decoder_ring)
+rank_states35 = rank_states_by_demand(df_demand2035, decoder_ring)
+
+# Merge rankings by state
+rank_states = rank_states25[['state', 'rank_residential_dem', 'rank_total_dem']].merge(
+    rank_states35[['state', 'rank_residential_dem', 'rank_total_dem']],
+    on='state',
+    suffixes=('_25', '_35')
+)
+
+# Sorting (similar to R arrange)
+# rank_states.sort_values(by='rank_residential_dem_25')  # By 2025 residential rank
+# rank_states.sort_values(by='rank_residential_dem_35')  # By 2035 residential rank
+# rank_states.sort_values(by='rank_total_dem_25')        # By 2025 total demand rank
+# rank_states.sort_values(by='rank_total_dem_35')        # By 2035 total demand rank
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+
+def summarize_and_rank_aep(df, scenario_name):
+    # Group by state and sum all relevant columns
+    grouped = df.groupby('state').agg(
+        cost_viable_aep_sum_twh=('cost_viable_aep_sum_twh', 'sum'),
+        cost_viable_res_aep_sum_twh=('cost_viable_res_aep_sum_twh', 'sum'),
+        total_tWh=('total_tWh', 'sum'),
+        Residential_tWh=('Residential_tWh', 'sum')
+    ).reset_index()
+
+    # Calculate ratios per state (now using state-specific denominators)
+    grouped['total_aep_demand'] = grouped['cost_viable_aep_sum_twh'] / grouped['total_tWh']
+    grouped['total_res_aep_demand'] = grouped['cost_viable_res_aep_sum_twh'] / grouped['Residential_tWh']
+
+    # Add total fields
+    grouped['total_aep_res'] = grouped['cost_viable_res_aep_sum_twh']
+    grouped['total_aep'] = grouped['cost_viable_aep_sum_twh']
+
+    # Ranking
+    grouped['rank_demand'] = grouped['total_aep_demand'].rank(ascending=False, method='min')
+    grouped[f'rank_res_{scenario_name}'] = grouped['total_aep_res'].rank(ascending=False, method='min')
+    grouped[f'rank_res_aep_demand_{scenario_name}'] = grouped['total_res_aep_demand'].rank(ascending=False, method='min')
+    grouped[f'rank_total_aep_{scenario_name}'] = grouped['total_aep'].rank(ascending=False, method='min')
+
+    grouped['scenario'] = scenario_name
+
+    return grouped
+```
+
+```{python}
+#| warning: false
+#| message: false
+df_2025 = summarize_and_rank_aep(df2025btm, "2025")
+df_2035 = summarize_and_rank_aep(df2035btm, "2035")
+```
+
+Correlations and rankings are the same in R and Python for both scenarios.
+
+```{python}
+#| warning: false
+#| message: false
+corr2025_btm_AEPres_EB = corr2025.sort_values('kendall', ascending=False)
+corr2025_btm_AEPres_EB['rank_kendall_25'] = range(1, len(corr2025) + 1)
+
+corr2035_btm_AEPres_EB = corr2035.sort_values('kendall', ascending=False)
+corr2035_btm_AEPres_EB['rank_kendall_35'] = range(1, len(corr2035) + 1)
+
+# Merge on 'state'
+df_ranking_comparison2535 = pd.merge(corr2025_btm_AEPres_EB[['state', 'rank_kendall_25']],
+                                    pd.concat([df_2025, df_2035]),
+                                    on='state', how='left')
+
+df_ranking_comparison2535 = pd.merge(corr2035_btm_AEPres_EB[['state', 'rank_kendall_35']],
+                                    df_ranking_comparison2535,
+                                    on='state', how='left')
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+
+# Pivot rank_demand column by scenario
+pivot = df_ranking_comparison2535.pivot(index='state', columns='scenario', values='rank_demand')
+pivot.columns = [f'rank_demand_{col}' for col in pivot.columns]
+
+# Combine pivoted columns with original df
+df_combined = df_ranking_comparison2535.merge(pivot, on='state', how='left')
+
+# Define coalesce function (use first non-null)
+def coalesce(series):
+    return series.dropna().iloc[0] if not series.dropna().empty else np.nan
+
+# Group by state and summarize with coalesce
+def summarize_ranks(group):
+    d = {
+        'rank_res_aep_demand_2025': coalesce(group['rank_res_aep_demand_2025']),
+        'rank_res_aep_demand_2035': coalesce(group['rank_res_aep_demand_2035']),
+        'rank_demand_25': coalesce(group['rank_demand_2025']),
+        'rank_demand_35': coalesce(group['rank_demand_2035']),
+        'rank_kendall_25': coalesce(group['rank_kendall_25']),
+        'rank_kendall_35': coalesce(group['rank_kendall_35']),
+        'rank_res_2025': coalesce(group['rank_res_2025']),
+        'rank_res_2035': coalesce(group['rank_res_2035']),
+        'rank_total_aep_2025': coalesce(group['rank_total_aep_2025']),
+        'rank_total_aep_2035': coalesce(group['rank_total_aep_2035']),
+    }
+    return pd.Series(d)
+
+df_ranking_2025 = df_combined.groupby('state').apply(summarize_ranks).reset_index()
+df_ranking_2025 = pd.merge(rank_states, df_ranking_2025, on='state', how='left')
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+def sum_ignore_na(*args):
+    return sum([x for x in args if pd.notnull(x)])
+
+df_ranking_2025['rankW_tot'] = df_ranking_2025.apply(lambda r: sum_ignore_na(r['rank_total_aep_2025'], r['rank_total_aep_2035']), axis=1)
+df_ranking_2025['rankW_AEP'] = df_ranking_2025.apply(lambda r: sum_ignore_na(r['rank_demand_25'], r['rank_demand_35']), axis=1)
+df_ranking_2025['rank_corr'] = df_ranking_2025.apply(lambda r: sum_ignore_na(r['rank_kendall_25'], r['rank_kendall_35']), axis=1)
+df_ranking_2025['rankW_AEP_demand_corr'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_kendall_25'], r['rank_kendall_35'], r['rank_demand_25'], r['rank_demand_35']), axis=1)
+df_ranking_2025['rankW_res_AEPdemand'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_kendall_25'], r['rank_kendall_35'], r['rank_res_aep_demand_2025'], r['rank_res_aep_demand_2035']), axis=1)
+df_ranking_2025['rankW_res'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_kendall_25'], r['rank_kendall_35'], r['rank_res_2025'], r['rank_res_2035']), axis=1)
+df_ranking_2025['rankW_res_AEPdemand_only'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_res_aep_demand_2025'], r['rank_res_aep_demand_2035']), axis=1)
+df_ranking_2025['rankRes_alone'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_res_2025'], r['rank_res_2035']), axis=1)
+df_ranking_2025['rankW_res_all'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_kendall_25'], r['rank_kendall_35'], r['rank_res_2025'], r['rank_res_2035'], 
+    r['rank_res_aep_demand_2025'], r['rank_res_aep_demand_2035']), axis=1)
+df_ranking_2025['rankW_res_all_AEP'] = df_ranking_2025.apply(lambda r: sum_ignore_na(
+    r['rank_demand_25'], r['rank_demand_35']), axis=1)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+df_ranking_2025['rankW_res_demand'] = (
+    0.5 * (df_ranking_2025['rank_kendall_25'] + df_ranking_2025['rank_kendall_35']) +
+    0.25 * (df_ranking_2025['rank_res_aep_demand_2025'] + df_ranking_2025['rank_res_aep_demand_2035']) +
+    0.25 * (df_ranking_2025['rank_residential_dem_25'] + df_ranking_2025['rank_residential_dem_25'])
+)
+```
+
+Rankings work in R and Python
+
+#### Group 1: High-Need, High-Potential States
+
+$$
+\text{rank}_{\text{res\_demand}} = 
+0.5 \cdot (\text{rank}_{25} + \text{rank}_{35}) +
+0.25 \cdot (\text{rank}_{AEP/D,25} + \text{rank}_{AEP/D,35}) +
+0.25 \cdot (\text{rank}_{\text{Dem},25} + \text{rank}_{\text{Dem},35})
+$$
+
+
+```{python}
+#| warning: false
+#| message: false
+(df_ranking_2025.sort_values('rankW_res_demand').head(5))
+```
+
+#### Group 2: High AEP\textsubscript{Demand}, Low-EB States
+
+```{python}
+#| warning: false
+#| message: false
+(df_ranking_2025.sort_values('rankW_AEP').head(3))
+```
+
+## 3.5 Mixed effects modeling
+
+First we standardize the columns for having more stability on the mixed model
+
+```{python}
+#| warning: false
+#| message: false
+def check_high_sd_columns(df, year=None, threshold=5.0, exclude_cols=[0, 1, 2, 28]):
+   
+    include_cols = [col for idx, col in enumerate(df.columns) if idx not in exclude_cols]
+
+    
+    numeric_cols = df[include_cols].select_dtypes(include=[np.number])
+
+    
+    std_devs = numeric_cols.std(skipna=True)
+    high_sd = std_devs[std_devs > threshold]
+
+    result_df = pd.DataFrame({
+        "Column": high_sd.index,
+        "SD": high_sd.values
+    })
+
+    print(f"\nHigh SD columns for {year} (> {threshold}):")
+    print(result_df)
+
+    return high_sd.index.tolist()
+def standardize_columns(df, columns):
+    df = df.copy()
+    for col in columns:
+        df[f"{col}_standardized"] = (df[col] - df[col].mean()) / df[col].std()
+    return df
+```
+
+```{python}
+#| warning: false
+#| message: false
+hsd2025 = check_high_sd_columns(df2025btm, year="2025", threshold=5.0)
+hsd2035 = check_high_sd_columns(df2035btm, year="2035", threshold=5.0)
+```
+
+```{python}
+#| warning: false
+#| message: false
+df2025btm = standardize_columns(df2025btm, hsd2025)
+df2035btm = standardize_columns(df2035btm, hsd2035)
+```
+
+Energy buden as response variable
+
+```{python}
+#| warning: false
+#| message: false
+from statsmodels.regression.mixed_linear_model import MixedLM
+from statsmodels.tools import add_constant
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+from statsmodels.regression.mixed_linear_model import MixedLM
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import pandas as pd
+
+def fit_mixed_effects_model(df, outcome_var, group_var='state'):
+    
+    predictors = ['UnemploymentRate', 'Poverty%_standardized', 'AgricultureInd', 'NonWhite_standardized']
+    df_model = df[[outcome_var, group_var] + predictors].dropna().copy()
+
+    
+    X = sm.add_constant(df_model[predictors])
+    y = df_model[outcome_var]
+    groups = df_model[group_var]
+
+    
+    model = MixedLM(endog=y, exog=X, groups=groups)
+    model_fit = model.fit(reml=True)
+
+    # VIF: Collinearity checker
+    vif_data = pd.DataFrame()
+    vif_data["variable"] = X.columns
+    vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+
+    return model_fit, vif_data
+```
+
+$R^2$ calculation
+
+```{python}
+#| warning: false
+#| message: false
+def mixed_model_r_squared(model):
+   
+   
+    fe_fitted = model.fittedvalues
+    var_fixed = np.var(fe_fitted, ddof=1)
+
+   
+    try:
+        var_random = float(model.cov_re.iloc[0, 0])
+    except:
+        var_random = 0
+
+   
+    var_resid = model.scale
+
+   
+    var_total = var_fixed + var_random + var_resid
+
+    
+    r2_marginal = var_fixed / var_total
+
+   
+    r2_conditional = (var_fixed + var_random) / var_total
+
+    return {
+        "R2_marginal": round(r2_marginal, 4),
+        "R2_conditional": round(r2_conditional, 4),
+        "Var_fixed": round(var_fixed, 4),
+        "Var_random": round(var_random, 4),
+        "Var_residual": round(var_resid, 4)
+    }
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.stats import kstest, norm, probplot
+
+def diagnostic_plots(model, model_name="Model"):
+   
+    fitted_vals = model.fittedvalues
+    residuals = model.resid
+
+    
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+
+    # 1. Residuals vs Fitted
+    axs[0].scatter(fitted_vals, residuals, alpha=0.6, color="cornflowerblue")
+    axs[0].axhline(0, color="red", linestyle="--")
+    axs[0].set_title(f"Residuals vs Fitted: {model_name}")
+    axs[0].set_xlabel("Fitted Values")
+    axs[0].set_ylabel("Residuals")
+
+    # 2. Q-Q Plot
+    probplot(residuals, dist="norm", plot=axs[1])
+    axs[1].set_title(f"QQ Plot: {model_name}")
+
+    # 3. Histogram
+    axs[2].hist(residuals, bins=30, color="lightblue", edgecolor="black")
+    axs[2].set_title(f"Histogram of Residuals: {model_name}")
+    axs[2].set_xlabel("Residuals")
+
+    plt.tight_layout()
+    plt.show()
+
+    # 4. Kolmogorov–Smirnov test for normality
+    ks_stat, p_val = kstest(residuals, 'norm', args=(np.mean(residuals), np.std(residuals)))
+    print(f"\n--- {model_name} ---")
+    print("Kolmogorov–Smirnov Test for Normality:")
+    print(f"D = {ks_stat:.4f} | p-value = {p_val:.4f}\n")
+
+```
+
+### 2025 BTM
+
+Energy Burden non transformed
+
+```{python}
+#| warning: false
+#| message: false
+model_2025, vif_2025 = fit_mixed_effects_model(df2025btm, outcome_var='EBres')
+print(model_2025.summary())
+print(vif_2025)
+r2_results = mixed_model_r_squared(model_2025)
+print(r2_results)
+
+```
+
+Diagnosis for the model
+
+```{python}
+#| warning: false
+#| message: false
+diagnostic_plots(model_2025, model_name="EBres 2025")
+```
+
+Energy burden with Box-Cox transformation
+
+```{python}
+#| warning: false
+#| message: false
+model_2025_bc, vif_2025_bc = fit_mixed_effects_model(df2025btm, outcome_var='EBres_boxcox')
+print(model_2025_bc.summary())
+print(vif_2025_bc)
+```
+
+Diagnosis for the model
+
+```{python}
+#| warning: false
+#| message: false
+diagnostic_plots(model_2025_bc, model_name="EBres-Box-Cox 2025")
+```
+
+### 2035 BTM
+
+Energy Burden non transformed
+
+```{python}
+#| warning: false
+#| message: false
+model_2035, vif_2035 = fit_mixed_effects_model(df2035btm, outcome_var='EBres')
+print(model_2035.summary())
+print(vif_2035)
+```
+
+Diagnosis for the model
+
+```{python}
+#| warning: false
+#| message: false
+diagnostic_plots(model_2035, model_name="EBres 2025")
+```
+
+Energy burden with Box-Cox transformation
+
+```{python}
+#| warning: false
+#| message: false
+model_2035_bc, vif_2035_bc = fit_mixed_effects_model(df2035btm, outcome_var='EBres_boxcox')
+print(model_2035_bc.summary())
+print(vif_2035_bc)
+```
+
+Diagnosis for the model
+
+```{python}
+#| warning: false
+#| message: false
+diagnostic_plots(model_2035_bc, model_name="EBres-Box-Cox 2025")
+```
+
+### Key Findings from Linear Mixed Models Relating Energy Burden to Socioeconomic Variables (2025 and 2035)
+
+The residuals indicate normal behavior, which suggests the model is well-specified.
+
+#### There is variability across states
+The estimated variance due to the grouping variable (state) is larger than the standard error, which means there is variability across states.
+
+#### **1. Poverty Rate Exhibits the Strongest Positive Association**
+The standardized poverty percentage (`Poverty%_standardized`) consistently demonstrates a **strong, statistically significant positive effect** on energy burden:
+
+
+**Interpretation:** Higher poverty rates are strongly associated with increased energy burdens. This indicates that households in areas with higher poverty levels are likely facing greater difficulty in affording energy.
+
+#### **2. Agricultural Employment Share Shows a Positive Association** too.
+The share of agricultural employment (`AgricultureInd`) is also consistently **positive and statistically significant**:
+  
+**Interpretation:** Counties with a higher share of agricultural employment tend to have weak-higher energy burdens, potentially due to rural infrastructure limitations and income instability in agricultural sectors.
+
+#### **3. Nonwhite Population Share Shows a Negative Association**
+The standardized nonwhite population share (`NonWhite_standardized`) has a **significant negative relationship** with energy burden:
+
+
+**Interpretation:** After adjusting for poverty and rurality, counties with a higher percentage of nonwhite populations tend to show slightly lower energy burdens. This may reflect differences in urban versus rural contexts or variations in household energy consumption patterns.
+
+#### **4. Unemployment Rate Shows a Weak Association**
+The unemployment rate (`UnemploymentRate`) shows a **small and statistically insignificant effect** across all years:
+
+**Interpretation:** The unemployment rate has a minimal impact on energy burden once other factors, such as poverty and structural economic conditions, are taken into account.
+
+## 3.6 State - level regression models by group
+
+Given that there is variability by state as a conclusion of the mixed effects models, 
+
+First determine a good sample size
+
+- `u = 4`: 4 predictors (independent variables),
+    - `f2 = 0.35`: large effect size,
+    - `sig.level = 0.01`: 1% significance level,
+    - `power = 0.80`: 80% desired power.
+  
+- **`n = result$v + result$u + 1`**:
+  - Calculates the required sample size (`n`):
+    - `result$v`: residual degrees of freedom (related to `n - u - 1`),
+    - `result$u`: number of predictors,
+    - Adds 1 to account for the intercept.
+
+
+```{python}
+#| warning: false
+#| message: false
+from statsmodels.stats.power import FTestPower
+import numpy as np
+
+# Parameters
+f2 = 0.35
+f = np.sqrt(f2)  # Cohen's f
+alpha = 0.01
+power = 0.80
+u = 4  # Number of predictors (numerator df)
+
+# Initialize power analysis
+f_test = FTestPower()
+
+# Solve for total sample size
+n = f_test.solve_power(effect_size=f, df_num=u, alpha=alpha, power=power)
+
+# Handle numpy array result
+n_rounded = round(n.item())
+
+print(f"Required sample size: 54")
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+def generate_state_summary(df, threshold=54):
+    state_counts = df['state'].value_counts().sort_index()
+    less_than_54 = state_counts[state_counts < threshold]
+    more_than_54 = state_counts[state_counts >= threshold]
+
+    print("### Data Count by State\n")
+
+    print("#### States with less than 54 observations:")
+    print("| State | Count |")
+    print("|-------|-------|")
+    for state, count in less_than_54.items():
+        print(f"| {state} | {count} |")
+
+    print("\n#### States with more than or equal to 54 observations:")
+    print("| State | Count |")
+    print("|-------|-------|")
+    for state, count in more_than_54.items():
+        print(f"| {state} | {count} |")
+
+
+generate_state_summary(df2025btm)
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+def lm_generation(df, state):
+    
+    df_state = df[df['state'] == state]
+
+    
+    model = smf.ols(
+        formula='EBres ~ UnemploymentRate + Q("Poverty%_standardized") + AgricultureInd + NonWhite_standardized',
+        data=df_state
+    ).fit()
+
+    return model
+
+def lm_generation_interactions(df, state):
+   
+    df_state = df[df['state'] == state]
+
+    
+    model = smf.ols(
+        formula='EBres ~ (UnemploymentRate + Q("Poverty%_standardized") + AgricultureInd + NonWhite_standardized)**2',
+        data=df_state
+    ).fit()
+
+    return model
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from scipy import stats
+import statsmodels.stats.api as sms
+
+def diagnostic_plots(model, model_name="Model"):
+    residuals = model.resid.dropna()
+    fitted = model.fittedvalues.loc[residuals.index]
+
+    plt.figure(figsize=(18, 5))
+
+    # 1. Residuals vs Fitted
+    plt.subplot(1, 3, 1)
+    plt.scatter(fitted, residuals, color='cornflowerblue', edgecolor='k', alpha=0.7)
+    plt.axhline(0, color='red', linestyle='--')
+    plt.title(f"Residuals vs Fitted: {model_name}")
+    plt.xlabel("Fitted Values")
+    plt.ylabel("Residuals")
+
+    # 2. QQ Plot
+    plt.subplot(1, 3, 2)
+    stats.probplot(residuals, dist="norm", plot=plt)
+    plt.title(f"QQ Plot: {model_name}")
+
+    # 3. Histogram of Residuals
+    plt.subplot(1, 3, 3)
+    sns.histplot(residuals, bins=30, kde=False, color='lightblue')
+    plt.title(f"Histogram of Residuals: {model_name}")
+    plt.xlabel("Residuals")
+
+    plt.tight_layout()
+    plt.show()
+
+    # 4. Kolmogorov-Smirnov test for normality
+    ks_stat, ks_pvalue = stats.kstest(
+        residuals,
+        'norm',
+        args=(residuals.mean(), residuals.std())
+    )
+
+    # 5. Breusch-Pagan test for heteroskedasticity
+    bp_test = sms.het_breuschpagan(residuals, model.model.exog)
+    bp_stat, bp_pvalue = bp_test[0], bp_test[1]
+
+    # Output test results
+    print(f"\n--- {model_name} ---")
+    print("Kolmogorov-Smirnov Test for Normality:")
+    print(f"D = {ks_stat:.4f} | p-value = {ks_pvalue:.4f}")
+    print("Breusch-Pagan Test for Homoskedasticity:")
+    print(f"Chi-Sq = {bp_stat:.4f} | p-value = {bp_pvalue:.4f}\n")
+
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+def plot_energy_gdp_histogram(state_name, df):
+    # Filter data by state
+    state_data = df[df['state'] == state_name].copy()
+
+    # Drop rows where energy_gdplog is NaN
+    state_data = state_data[state_data['energy_gdplog'].notna()]
+
+    if state_data.empty:
+        print(f"Warning: No data available for state: {state_name}")
+        return None
+
+    median_state = state_data['energy_gdplog'].median()
+    q90 = state_data['EBres'].quantile(0.9)
+    q90_energy = state_data['energy_gdplog'].quantile(0.9)
+
+    plt.figure(figsize=(10, 6))
+    sns.histplot(state_data['energy_gdplog'], bins=15,
+                 color='darkseagreen', edgecolor='darkseagreen', alpha=0.7)
+
+    # Vertical lines
+    plt.axvline(median_state, color='black', linestyle='dashed', linewidth=1, label='Median')
+    plt.axvline(q90_energy, color='red', linestyle='dashed', linewidth=1, label='90th Percentile')
+
+    # Titles and labels
+    plt.title(f"Energy Burden GDP Distribution in {state_name}", fontsize=16, ha='center')
+    plt.xlabel("Energy Burden GDP (log-transformed)", fontsize=14)
+    plt.ylabel("Count of Counties", fontsize=14)
+
+    # Annotate median and 90th percentile EBres
+    plt.text(median_state - median_state / 5, 10,
+             f"Median: {median_state:.2f}", color='black', fontsize=12)
+    plt.text(median_state - median_state / 5, 9,
+             f"90th Percentile EBres: {q90:.2f}", color='red', fontsize=12)
+
+    plt.tight_layout()
+    plt.legend()
+    plt.show()
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+def kendall_tau_a(x, y):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    n = len(x)
+    concordant = discordant = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            concordant += (x[i] - x[j]) * (y[i] - y[j]) > 0
+            discordant += (x[i] - x[j]) * (y[i] - y[j]) < 0
+    return (concordant - discordant) / (0.5 * n * (n - 1))
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, kendalltau
+
+def corrAEP_EB_State(df, fombtm, scenario, state):
+    # Filter by state
+    df_state = df[df['state'] == state].copy()
+
+    clean_df_log = df_state[
+        (~np.isinf(df_state['aepRES_demand_boxcox'])) &
+        (~df_state['aepRES_demand_boxcox'].isna()) &
+        (~df_state['EBres_boxcox'].isna()) &
+        (df_state['aepRES_demand'] > 0)
+    ][['aepRES_demand', 'EBres_boxcox', 'aepRES_demand_boxcox']]
+
+    clean_df_nc = df_state[
+        (~df_state['aepRES_demand'].isna()) &
+        (~df_state['EBres'].isna())
+    ][['aepRES_demand', 'EBres']]
+
+    # Check data sufficiency
+    if len(clean_df_log) < 3 or len(clean_df_nc) < 3:
+        print(f"Not enough data for {state} to calculate correlation.")
+        return None
+
+    # Calculate correlations with checks for zero std dev
+    if clean_df_log['aepRES_demand_boxcox'].std() == 0:
+        pearson_corr = np.nan
+    else:
+        pearson_corr, _ = pearsonr(clean_df_log['aepRES_demand_boxcox'], clean_df_log['EBres_boxcox'])
+
+    if clean_df_nc['aepRES_demand'].std() == 0:
+        kendall_corr = np.nan
+    else:
+        kendall_corr = kendall_tau_a(clean_df_nc['aepRES_demand'], clean_df_nc['EBres'])
+        
+
+    # Output results
+    print(f"{state} {fombtm} {scenario}")
+    print(f"Pearson Correlation (Box-Cox): {pearson_corr:.3f}")
+    print(f"Kendall Correlation (Raw): {kendall_corr:.3f}")
+
+    # Plot relationship (untransformed data)
+    plt.figure(figsize=(8,6))
+    sns.scatterplot(x='aepRES_demand', y='EBres', data=clean_df_nc, alpha=0.6, color="#4C90B1")
+    sns.regplot(x='aepRES_demand', y='EBres', data=clean_df_nc,
+                scatter=False, color='darkred', line_kws={'alpha':0.7}, ci=95)
+
+    plt.xlabel("AEP Demand (TWh/house)")
+    plt.ylabel("Energy Burden")
+    plt.title(f"AEP vs Energy Burden - {state} {fombtm} {scenario}")
+    plt.tight_layout()
+    plt.show()
+
+    return pd.DataFrame({
+        'state': [state],
+        'pearson': [pearson_corr],
+        'kendall': [kendall_corr]
+    })
+
+```
+
+
+```{python}
+#| warning: false
+#| message: false
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import geopandas as gpd
+import numpy as np
+
+def EB_county_map_state(df, summary_df, state_abbr):
+    # Filter summary dataframe for the specific state, drop NA for mean_ebres and median_ebres
+    summary_state = summary_df[
+        (summary_df['state'] == state_abbr) &
+        summary_df['mean_ebres'].notna() &
+        summary_df['median_ebres'].notna()
+    ]
+
+    if summary_state.empty:
+        print(f"No summary data available for state: {state_abbr}")
+        return
+
+    # Filter main df to state
+    df_state = df[df['state'] == state_abbr].copy()
+
+    # Join summary stats (mean, median) to main dataframe on state
+    df_state = df_state.merge(
+        summary_state[['state', 'mean_ebres', 'median_ebres']],
+        on='state', how='left'
+    )
+
+    # Calculate difference from median for each county
+    df_state['difference_from_median'] = df_state['EBres'] - df_state['median_ebres']
+
+    # Prepare county shapes - you can reuse your existing method to load counties shapefile
+    url = 'https://github.com/sabrilg-nrel/mapsusdatasupport/raw/main/cb_2020_us_county_20m.zip'
+    import requests, zipfile, tempfile, os
+    response = requests.get(url)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "counties.zip")
+        with open(zip_path, "wb") as f:
+            f.write(response.content)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmpdir)
+            shp_file = [f for f in z.namelist() if f.endswith('.shp')][0]
+            shp_path = os.path.join(tmpdir, shp_file)
+            counties = gpd.read_file(shp_path)
+
+    # Exclude Alaska (02), Hawaii (15), Puerto Rico (72)
+    counties = counties[~counties['STATEFP'].isin(['02', '15', '72'])]
+
+    # Filter counties to the given state by matching STATEFP to FIPS codes of state (use your own mapping)
+    # Here we will filter counties by state abbreviation, so need to map state_abbr to FIPS.
+    # For simplicity, use 'STATEFP' codes for the state abbreviation from a lookup dict:
+
+    state_fips_map = {
+        # Add your states and FIPS mappings as needed
+        'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08',
+        'CT': '09', 'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16',
+        'IL': '17', 'IN': '18', 'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22',
+        'ME': '23', 'MD': '24', 'MA': '25', 'MI': '26', 'MN': '27', 'MS': '28',
+        'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32', 'NH': '33', 'NJ': '34',
+        'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39', 'OK': '40',
+        'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
+        'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54',
+        'WI': '55', 'WY': '56'
+    }
+
+    state_fips = state_fips_map.get(state_abbr)
+    if state_fips is None:
+        print(f"State abbreviation {state_abbr} not recognized.")
+        return
+
+    counties_state = counties[counties['STATEFP'] == state_fips].copy()
+
+    # Prepare FIPS code in both datasets to merge on
+    df_state['fips'] = df_state['fips'].astype(str).str.zfill(5)
+    counties_state['fips'] = counties_state['STATEFP'] + counties_state['COUNTYFP']
+
+    # Merge spatial data with main df
+    counties_state = counties_state.merge(df_state, on='fips', how='left')
+
+    # Set color for above/below mean
+    counties_state['county_color_mean'] = np.where(
+        counties_state['EBres'] < counties_state['mean_ebres'],
+        'Below',
+        'Above'
+    )
+
+    # Plot 1: Above/Below State Mean (categorical)
+    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    color_map = {'Above': 'yellow', 'Below': 'purple'}
+    counties_state['color_mean'] = counties_state['county_color_mean'].map(color_map).fillna('#dddddd')
+    counties_state.plot(color=counties_state['color_mean'], ax=ax1, edgecolor='white')
+    patches = [mpatches.Patch(color=color_map[k], label=k) for k in color_map]
+    ax1.legend(handles=patches, title="Energy Burden")
+    ax1.set_title(f"Energy Burden % in {state_abbr} (Above/Below State Mean)")
+    ax1.axis('off')
+
+    # Plot 2: Difference from median (continuous gradient)
+    fig2, ax2 = plt.subplots(figsize=(12, 8))
+    counties_state.plot(
+        column='difference_from_median',
+        cmap='RdYlGn_r',
+        legend=True,
+        legend_kwds={'label': "Difference from Median"},
+        ax=ax2,
+        edgecolor='white'
+    )
+    ax2.set_title(f"Energy Burden % in {state_abbr} (Difference from State Median)")
+    ax2.axis('off')
+
+    plt.show()
+
+```
+
+### Group 1
+
+#### North Carollina
+
+##### 2025
+
+```{python}
+#| warning: false
+#| message: false
+state = "NC"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corrNC_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrNC_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+#| warning: false
+#| message: false
+lm_NC2025btm = lm_generation(df2025btm, state)
+print(lm_NC2025btm.summary())
+diagnostic_plots(lm_NC2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+#| warning: false
+#| message: false
+lm_NC2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_NC2025btm_int.summary())
+diagnostic_plots(lm_NC2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+#| warning: false
+#| message: false
+state = "NC"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corrNC_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrNC_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+#| warning: false
+#| message: false
+lm_NC2035btm = lm_generation(df2035btm, state)
+print(lm_NC2035btm.summary())
+diagnostic_plots(lm_NC2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+#| warning: false
+#| message: false
+lm_NC2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_NC2035btm_int.summary())
+diagnostic_plots(lm_NC2035btm_int, f"{state} 2035")
+```
+
+
+#### Georgia
+
+##### 2025
+
+```{python}
+#| warning: false
+#| message: false
+state = "GA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corrGA_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrGA_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+#| warning: false
+#| message: false
+lm_GA2025btm = lm_generation(df2025btm, state)
+print(lm_GA2025btm.summary())
+diagnostic_plots(lm_GA2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+#| warning: false
+#| message: false
+lm_GA2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_GA2025btm_int.summary())
+diagnostic_plots(lm_GA2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+#| warning: false
+#| message: false
+state = "GA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corrGA_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrGA_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+#| warning: false
+#| message: false
+lm_GA2035btm = lm_generation(df2035btm, state)
+print(lm_GA2035btm.summary())
+diagnostic_plots(lm_GA2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+#| warning: false
+#| message: false
+lm_GA2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_GA2035btm_int.summary())
+diagnostic_plots(lm_GA2035btm_int, f"{state} 2035")
+```
+
+#### Iowa
+
+##### 2025
+
+```{python}
+#| warning: false
+#| message: false
+state = "IA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+#| warning: false
+#| message: false
+corrIA_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrIA_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+#| warning: false
+#| message: false
+lm_IA2025btm = lm_generation(df2025btm, state)
+print(lm_IA2025btm.summary())
+diagnostic_plots(lm_IA2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+#| warning: false
+#| message: false
+lm_IA2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_IA2025btm_int.summary())
+diagnostic_plots(lm_IA2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "IA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrIA_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrIA_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_IA2035btm = lm_generation(df2035btm, state)
+print(lm_IA2035btm.summary())
+diagnostic_plots(lm_IA2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_IA2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_IA2035btm_int.summary())
+diagnostic_plots(lm_IA2035btm_int, f"{state} 2035")
+```
+
+#### California
+
+##### 2025
+
+```{python}
+
+state = "CA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrCA_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrCA_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_CA2025btm = lm_generation(df2025btm, state)
+print(lm_CA2025btm.summary())
+diagnostic_plots(lm_CA2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_CA2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_CA2025btm_int.summary())
+diagnostic_plots(lm_CA2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "CA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrCA_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrCA_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_CA2035btm = lm_generation(df2035btm, state)
+print(lm_CA2035btm.summary())
+diagnostic_plots(lm_CA2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_CA2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_CA2035btm_int.summary())
+diagnostic_plots(lm_CA2035btm_int, f"{state} 2035")
+```
+
+
+#### Lousiana
+
+##### 2025
+
+```{python}
+
+state = "LA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrLA_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrLA_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_LA2025btm = lm_generation(df2025btm, state)
+print(lm_LA2025btm.summary())
+diagnostic_plots(lm_LA2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_LA2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_LA2025btm_int.summary())
+diagnostic_plots(lm_LA2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "LA"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrLA_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrLA_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_LA2035btm = lm_generation(df2035btm, state)
+print(lm_LA2035btm.summary())
+diagnostic_plots(lm_LA2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_LA2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_LA2035btm_int.summary())
+diagnostic_plots(lm_LA2035btm_int, f"{state} 2035")
+```
+
+### Group 2
+#### Wisconsin
+
+##### 2025
+
+```{python}
+
+state = "WI"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrWI_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrWI_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_WI2025btm = lm_generation(df2025btm, state)
+print(lm_WI2025btm.summary())
+diagnostic_plots(lm_WI2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_WI2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_WI2025btm_int.summary())
+diagnostic_plots(lm_WI2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "WI"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrWI_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrWI_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_WI2035btm = lm_generation(df2035btm, state)
+print(lm_WI2035btm.summary())
+diagnostic_plots(lm_WI2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_WI2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_WI2035btm_int.summary())
+diagnostic_plots(lm_WI2035btm_int, f"{state} 2035")
+```
+
+#### Kansas
+
+##### 2025
+
+```{python}
+
+state = "KS"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrKS_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrKS_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_KS2025btm = lm_generation(df2025btm, state)
+print(lm_KS2025btm.summary())
+diagnostic_plots(lm_KS2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_KS2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_KS2025btm_int.summary())
+diagnostic_plots(lm_KS2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "KS"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrKS_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrKS_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_KS2035btm = lm_generation(df2035btm, state)
+print(lm_KS2035btm.summary())
+diagnostic_plots(lm_KS2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_KS2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_KS2035btm_int.summary())
+diagnostic_plots(lm_KS2035btm_int, f"{state} 2035")
+```
+
+#### Minnesota
+
+##### 2025
+
+```{python}
+
+state = "MN"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrMN_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrMN_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_MN2025btm = lm_generation(df2025btm, state)
+print(lm_MN2025btm.summary())
+diagnostic_plots(lm_MN2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_MN2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_MN2025btm_int.summary())
+diagnostic_plots(lm_MN2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "MN"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrMN_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrMN_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_MN2035btm = lm_generation(df2035btm, state)
+print(lm_MN2035btm.summary())
+diagnostic_plots(lm_MN2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_MN2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_MN2035btm_int.summary())
+diagnostic_plots(lm_MN2035btm_int, f"{state} 2035")
+```
+
+### Special cases
+#### Alabama
+
+##### 2025
+
+```{python}
+
+state = "AL"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrAL_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrAL_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_AL2025btm = lm_generation(df2025btm, state)
+print(lm_AL2025btm.summary())
+diagnostic_plots(lm_AL2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_AL2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_AL2025btm_int.summary())
+diagnostic_plots(lm_AL2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "AL"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrAL_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrAL_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_AL2035btm = lm_generation(df2035btm, state)
+print(lm_AL2035btm.summary())
+diagnostic_plots(lm_AL2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_AL2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_AL2035btm_int.summary())
+diagnostic_plots(lm_AL2035btm_int, f"{state} 2035")
+```
+
+#### Texas
+
+##### 2025
+
+```{python}
+
+state = "TX"
+
+hist_plot = plot_energy_gdp_histogram(state, df2025btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2025.loc[summary_EBres_2025['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrTX_2025 = corrAEP_EB_State(df2025btm, 'BTM', '2025', state)
+print(corrTX_2025)
+EB_county_map_state(df2025btm, summary_EBres_2025, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_TX2025btm = lm_generation(df2025btm, state)
+print(lm_TX2025btm.summary())
+diagnostic_plots(lm_TX2025btm, f"{state} 2025")
+```
+
+Model with interactions
+
+```{python}
+lm_TX2025btm_int = lm_generation_interactions(df2025btm, state)
+print(lm_TX2025btm_int.summary())
+diagnostic_plots(lm_TX2025btm_int, f"{state} 2025")
+```
+
+##### 2035
+
+```{python}
+
+state = "TX"
+
+hist_plot = plot_energy_gdp_histogram(state, df2035btm)
+if hist_plot:
+    hist_plot.show()
+
+print("Median EBres:", summary_EBres_2035.loc[summary_EBres_2035['state'] == state, 'median_ebres'].values)
+
+```
+
+```{python}
+corrTX_2035 = corrAEP_EB_State(df2035btm, 'BTM', '2035', state)
+print(corrTX_2035)
+EB_county_map_state(df2035btm, summary_EBres_2035, state_abbr=state)
+```
+
+Model without interactions
+```{python}
+lm_TX2035btm = lm_generation(df2035btm, state)
+print(lm_TX2035btm.summary())
+diagnostic_plots(lm_TX2035btm, f"{state} 2035")
+```
+
+Model with interactions
+
+```{python}
+lm_TX2035btm_int = lm_generation_interactions(df2035btm, state)
+print(lm_TX2035btm_int.summary())
+diagnostic_plots(lm_GA2035btm_int, f"{state} 2035")
+```
